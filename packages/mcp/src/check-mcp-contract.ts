@@ -12,9 +12,12 @@ import { createMcpStatus, sanitizeUnavailableReason, type OpenPetsMcpStatus } fr
 
 parseMcpArgs(["--pet", "snoopy"]);
 parseMcpArgs(["--pet=snoopy"]);
+parseMcpArgs(["--backend", "termux"]);
+parseMcpArgs(["--backend=ipc"]);
 parseMcpArgs(["--pet", "Bad Pet"]);
 parseMcpArgs(["--help"]);
 assertRejects(() => parseMcpArgs(["--pet", "bad/pet"]));
+assertRejects(() => parseMcpArgs(["--backend", "bad"]));
 assertRejects(() => parseMcpArgs(["--agent", "claude"]));
 
 const unavailableStatus = createMcpStatus({ ok: false, appRunning: false, unavailableReason: "/Users/alvin/.config/OpenPets/runtime/ipc.json ENOENT" }, "snoopy");
@@ -92,7 +95,7 @@ async function checkStdioServerContract(): Promise<void> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [join("dist", "index.js"), "--pet", "snoopy"],
-    env: { ...process.env, OPENPETS_DISCOVERY_FILE: join(process.cwd(), ".missing-openpets-discovery.json") },
+    env: { ...process.env, OPENPETS_DISCOVERY_FILE: join(process.cwd(), ".missing-openpets-discovery.json"), OPENPETS_BACKEND: "ipc" },
     stderr: "pipe",
   });
   const client = new Client({ name: "openpets-stdio-contract", version: "0.0.0" });

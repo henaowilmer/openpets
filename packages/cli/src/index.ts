@@ -30,17 +30,21 @@ interface InstallOptions {
 
 interface ReactOptions {
   readonly reaction: OpenPetsReaction;
+  readonly backend?: BackendOption;
 }
 
 interface SayOptions {
   readonly message: string;
   readonly reaction?: OpenPetsReaction;
+  readonly backend?: BackendOption;
 }
 
 interface CommandSpec {
   readonly command: string;
   readonly args: readonly string[];
 }
+
+type BackendOption = "ipc" | "termux";
 
 interface PreparedHooks {
   readonly settingsPath: string;
@@ -50,6 +54,11 @@ interface PreparedHooks {
 interface ConfiguredPet {
   readonly id: string;
   readonly displayName: string;
+}
+
+interface BackendResolved {
+  readonly backend?: BackendOption;
+  readonly args: readonly string[];
 }
 
 const require = createRequire(import.meta.url);
@@ -135,14 +144,18 @@ async function installPetFromCatalog(options: InstallOptions): Promise<void> {
 }
 
 async function showStatus(args: readonly string[]): Promise<void> {
-  if (args.length !== 0) throw new CliError(`Unknown status option: ${args[0]}`);
+  const { backend, args: rest } = parseBackendOption(args, "status");
+  if (rest.length !== 0) throw new CliError(`Unknown status option: ${rest[0]}`);
+  if (backend) process.env.OPENPETS_BACKEND = backend;
   const result = await createOpenPetsClient().status();
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (!result.ok || !result.appRunning) process.exitCode = 1;
 }
 
 async function showPets(args: readonly string[]): Promise<void> {
-  if (args.length !== 0) throw new CliError(`Unknown pets option: ${args[0]}`);
+  const { backend, args: rest } = parseBackendOption(args, "pets");
+  if (rest.length !== 0) throw new CliError(`Unknown pets option: ${rest[0]}`);
+  if (backend) process.env.OPENPETS_BACKEND = backend;
   const result = await createOpenPetsClient().listPets();
   for (const pet of result.pets) {
     const flags = [pet.id === result.defaultPetId ? "default" : undefined, pet.broken ? "broken" : undefined].filter(Boolean).join(", ");
@@ -151,11 +164,13 @@ async function showPets(args: readonly string[]): Promise<void> {
 }
 
 async function sendReaction(options: ReactOptions): Promise<void> {
+  if (options.backend) process.env.OPENPETS_BACKEND = options.backend;
   await createOpenPetsClient().react(options.reaction);
   process.stdout.write(`OpenPets reaction sent: ${options.reaction}\n`);
 }
 
 async function sendMessage(options: SayOptions): Promise<void> {
+  if (options.backend) process.env.OPENPETS_BACKEND = options.backend;
   await createOpenPetsClient().say(options.message, options.reaction ? { reaction: options.reaction } : undefined);
   process.stdout.write("OpenPets message sent.\n");
 }
@@ -337,11 +352,15 @@ export function parseInstallArgs(args: readonly string[]): InstallOptions {
 }
 
 export function parseReactArgs(args: readonly string[]): ReactOptions {
-  if (args.length !== 1) throw new CliError("Usage: openpets react <reaction>");
-  return { reaction: parseReaction(args[0] ?? "") };
+  const { backend, args: rest } = parseBackendOption(args, "react");
+  if (rest.length !== 1) throw new CliError("Usage: openpets react <reaction> [--backend <ipc|termux>]");
+  return backend ? { reaction: parseReaction(rest[0] ?? ""), backend } : { reaction: parseReaction(rest[0] ?? "") };
 }
 
 export function parseSayArgs(args: readonly string[]): SayOptions {
+  const backendParsed = parseBackendOption(args, "say");
+  const backend = backendParsed.backend;
+  args = backendParsed.args;
   let reaction: OpenPetsReaction | undefined;
   const messageParts: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -358,8 +377,8 @@ export function parseSayArgs(args: readonly string[]): SayOptions {
     }
   }
   const message = messageParts.join(" ").trim();
-  if (!message) throw new CliError("Usage: openpets say <message> [--reaction <reaction>]");
-  return { message, reaction };
+  if (!message) throw new CliError("Usage: openpets say <message> [--reaction <reaction>] [--backend <ipc|termux>]");
+  return backend ? { message, reaction, backend } : { message, reaction };
 }
 
 function parseReaction(value: string): OpenPetsReaction {
@@ -424,9 +443,11 @@ function runClaudeMcpRemove(projectDir: string): void {
 }
 
 async function runMcp(args: readonly string[]): Promise<void> {
+  const parsed = parseBackendOption(args, "mcp");
+  if (parsed.backend) process.env.OPENPETS_BACKEND = parsed.backend;
   const entry = require.resolve("@open-pets/mcp");
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [entry, ...args], { stdio: "inherit" });
+    const child = spawn(process.execPath, [entry, ...parsed.args], { stdio: "inherit" });
     const forwardSigint = (): void => { child.kill("SIGINT"); };
     const forwardSigterm = (): void => { child.kill("SIGTERM"); };
     process.once("SIGINT", forwardSigint);
@@ -563,7 +584,7 @@ function getPackageVersion(): string {
 }
 
 function printUsage(): void {
-  process.stdout.write("Usage:\n  openpets status\n  openpets pets\n  openpets react <reaction>\n  openpets say <message> [--reaction <reaction>]\n  openpets install <pet-id>\n  openpets configure [--agent claude|opencode|cursor] [--pet <id>] [--cwd <path>] [--yes] [--force] [--with-rules|--rules-only|--remove-rules]\n  openpets mcp [--pet <id>]\n  openpets hook --openpets-managed [--pet <id>]\n\nRun `openpets <command> --help` for command options.\n");
+  process.stdout.write("Usage:\n  openpets status [--backend <ipc|termux>]\n  openpets pets [--backend <ipc|termux>]\n  openpets react <reaction> [--backend <ipc|termux>]\n  openpets say <message> [--reaction <reaction>] [--backend <ipc|termux>]\n  openpets install <pet-id>\n  openpets configure [--agent claude|opencode|cursor] [--pet <id>] [--cwd <path>] [--yes] [--force] [--with-rules|--rules-only|--remove-rules]\n  openpets mcp [--pet <id>] [--backend <ipc|termux>]\n  openpets hook --openpets-managed [--pet <id>]\n\nRun `openpets <command> --help` for command options.\n");
 }
 
 function printInstallUsage(): void {
@@ -579,11 +600,11 @@ function printPetsUsage(): void {
 }
 
 function printReactUsage(): void {
-  process.stdout.write(`Usage:\n  openpets react <reaction>\n\nSends a reaction to the running OpenPets desktop app.\nAllowed reactions: ${allowedReactions.join(", ")}.\n`);
+  process.stdout.write(`Usage:\n  openpets react <reaction> [--backend <ipc|termux>]\n\nSends a reaction to the configured OpenPets backend (desktop IPC or Termux notifications).\nAllowed reactions: ${allowedReactions.join(", ")}.\n`);
 }
 
 function printSayUsage(): void {
-  process.stdout.write(`Usage:\n  openpets say <message> [--reaction <reaction>]\n\nShows a short message in the running OpenPets desktop app. Optionally sends a reaction with the message.\nAllowed reactions: ${allowedReactions.join(", ")}.\n`);
+  process.stdout.write(`Usage:\n  openpets say <message> [--reaction <reaction>] [--backend <ipc|termux>]\n\nShows a short message in the configured OpenPets backend (desktop IPC or Termux notifications). Optionally sends a reaction with the message.\nAllowed reactions: ${allowedReactions.join(", ")}.\n`);
 }
 
 function printConfigureUsage(): void {
@@ -591,7 +612,7 @@ function printConfigureUsage(): void {
 }
 
 function printMcpUsage(): void {
-  process.stdout.write("Usage:\n  openpets mcp [--pet <id>]\n\nStarts the OpenPets MCP server wrapper. This command is written into Claude MCP config by `openpets configure`.\n");
+  process.stdout.write("Usage:\n  openpets mcp [--pet <id>] [--backend <ipc|termux>]\n\nStarts the OpenPets MCP server wrapper. This command is written into Claude MCP config by `openpets configure`.\n");
 }
 
 function printHookUsage(): void {
@@ -607,6 +628,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 class CliError extends Error {}
+
+function parseBackendOption(input: readonly string[], commandName: string): BackendResolved {
+  let backend: BackendOption | undefined;
+  const args: string[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const arg = input[index];
+    if (arg === "--backend") {
+      const value = input[index + 1];
+      if (!value || value.startsWith("--")) throw new CliError(`Missing value for --backend in ${commandName} command.`);
+      if (value !== "ipc" && value !== "termux") throw new CliError(`Unsupported --backend value: ${value}. Use ipc or termux.`);
+      backend = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--backend=")) {
+      const value = arg.slice("--backend=".length);
+      if (value !== "ipc" && value !== "termux") throw new CliError(`Unsupported --backend value: ${value}. Use ipc or termux.`);
+      backend = value;
+      continue;
+    }
+
+    args.push(arg);
+  }
+
+  return { backend, args };
+}
 
 if (isMainModule()) {
   main().catch((error: unknown) => {

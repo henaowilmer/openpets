@@ -74,7 +74,8 @@ export function validateDiscovery(value: unknown): OpenPetsDiscoveryFile {
   if (value.platform !== "darwin" && value.platform !== "linux" && value.platform !== "win32") throw new OpenPetsClientError("invalid_discovery", "Discovery platform is invalid.");
 
   const endpoint = parseIpcEndpoint(value.endpoint);
-  if (value.platform !== process.platform && !allowsCrossPlatformDiscovery(value.platform, endpoint)) {
+  const clientPlatform = normalizeClientPlatform(process.platform);
+  if (value.platform !== clientPlatform && !allowsCrossPlatformDiscovery(value.platform, endpoint)) {
     throw new OpenPetsClientError("invalid_discovery", "Discovery platform does not match this client.");
   }
 
@@ -204,11 +205,18 @@ function allowsCrossPlatformDiscovery(platform: NodeJS.Platform, endpoint: Parse
   // Allow cross-platform discovery for TCP endpoints when:
   // - Desktop is Windows (win32) and client is Linux (WSL)
   // - The endpoint is a private/local IPv4 address (not just loopback)
-  if (endpoint.kind !== "tcp" || platform !== "win32" || process.platform !== "linux") {
+  const clientPlatform = normalizeClientPlatform(process.platform);
+  if (endpoint.kind !== "tcp" || platform !== "win32" || clientPlatform !== "linux") {
     return false;
   }
   // Additional validation: ensure the host is a valid private/local IPv4
   return isPrivateOrLocalIpv4(endpoint.host);
+}
+
+function normalizeClientPlatform(platform: NodeJS.Platform): "darwin" | "linux" | "win32" {
+  if (platform === "android") return "linux";
+  if (platform === "darwin" || platform === "linux" || platform === "win32") return platform;
+  return "linux";
 }
 
 function getSecureXdgRuntimeDir(): string | null {

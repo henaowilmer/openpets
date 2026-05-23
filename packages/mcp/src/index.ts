@@ -22,6 +22,9 @@ async function main(): Promise<void> {
     return;
   }
 
+  const forcedBackend = options.backend ?? process.env.OPENPETS_BACKEND;
+  if (forcedBackend) process.env.OPENPETS_BACKEND = forcedBackend;
+
   const lease: LeaseContext = {};
   const context = createToolContext(options.petId);
   const leaseReady = acquireStartupLease(context.client, lease, options.petId);

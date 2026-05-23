@@ -1,11 +1,13 @@
 export interface McpCliOptions {
   readonly petId?: string;
+  readonly backend?: "ipc" | "termux";
   readonly help: boolean;
   readonly version: boolean;
 }
 
 export function parseMcpArgs(argv: readonly string[]): McpCliOptions {
   let petId: string | undefined;
+  let backend: "ipc" | "termux" | undefined;
   let help = false;
   let version = false;
 
@@ -26,14 +28,27 @@ export function parseMcpArgs(argv: readonly string[]): McpCliOptions {
       index += 1;
       continue;
     }
+    if (arg === "--backend") {
+      const next = argv[index + 1];
+      if (!next || (next !== "ipc" && next !== "termux")) throw new Error("--backend requires one of: ipc, termux.");
+      backend = next;
+      index += 1;
+      continue;
+    }
     if (arg.startsWith("--pet=")) {
       petId = validateRawPetArg(arg.slice("--pet=".length));
+      continue;
+    }
+    if (arg.startsWith("--backend=")) {
+      const value = arg.slice("--backend=".length);
+      if (value !== "ipc" && value !== "termux") throw new Error("--backend requires one of: ipc, termux.");
+      backend = value;
       continue;
     }
     throw new Error(`Unknown argument: ${arg}`);
   }
 
-  return { petId, help, version };
+  return { petId, backend, help, version };
 }
 
 export function validatePetId(value: string): string {
@@ -53,5 +68,5 @@ export function validateRawPetArg(value: string): string {
 }
 
 export function createHelpText(): string {
-  return `OpenPets MCP server\n\nUsage:\n  open-pets-mcp [--pet <petId>]\n\nOptions:\n  --pet <petId>  Request an installed OpenPets pet for this MCP process; missing pets fall back to default.\n  --help         Show this help.\n  --version      Show package version.\n`;
+  return `OpenPets MCP server\n\nUsage:\n  open-pets-mcp [--pet <petId>] [--backend <ipc|termux>]\n\nOptions:\n  --pet <petId>          Request an installed OpenPets pet for this MCP process; missing pets fall back to default.\n  --backend <ipc|termux> Force IPC desktop backend or Termux notifications backend.\n  --help                 Show this help.\n  --version              Show package version.\n`;
 }

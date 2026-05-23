@@ -213,6 +213,43 @@ Available MCP tools:
 
 `openpets_say` messages must be short, single-line, and must not look like code, logs, secrets, URLs, or file paths.
 
+### Termux/Android notifications (experimental)
+
+If you run agents in Termux on Android, OpenPets can emit system notifications instead of using the desktop pet UI.
+
+Requirements:
+
+- Termux app
+- Termux:API app (from F-Droid)
+- `termux-api` package installed in Termux
+
+Quick checks:
+
+```bash
+pkg install termux-api
+termux-notification --help
+```
+
+Use notification backend explicitly:
+
+```bash
+openpets status --backend termux
+openpets react success --backend termux
+openpets say "Build finished" --reaction celebrating --backend termux
+```
+
+Or run MCP in notification mode:
+
+```bash
+openpets mcp --backend termux
+```
+
+You can also set an environment default:
+
+```bash
+export OPENPETS_BACKEND=termux
+```
+
 ## How it works
 
 ```text

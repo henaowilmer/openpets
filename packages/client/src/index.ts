@@ -2,10 +2,12 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 
 import { parseIpcEndpoint, readDiscoveryFile, type OpenPetsDiscoveryFile } from "./discovery.js";
+import { acquireTermuxLease, getTermuxBackendStatus, heartbeatTermuxLease, releaseTermuxLease, sendTermuxMessage, sendTermuxReaction, shouldUseTermuxBackend } from "./termux-backend.js";
 import { connectTimeoutMs, maxIpcMessageBytes, openPetsIpcVersion, parseIpcResponse, responseTimeoutMs, validateReaction, OpenPetsClientError, type OpenPetsIpcMethod, type OpenPetsIpcRequest, type OpenPetsReaction } from "./protocol.js";
 
 export { getDiscoveryFilePath, parseIpcEndpoint, readDiscoveryFile, validateDiscovery, validateEndpoint, type OpenPetsDiscoveryFile, type ParsedIpcEndpoint } from "./discovery.js";
 export { allowedReactions, OpenPetsClientError, type OpenPetsReaction } from "./protocol.js";
+export { isTermuxEnvironment, shouldUseTermuxBackend } from "./termux-backend.js";
 
 export interface OpenPetsClientOptions {
   readonly discoveryPath?: string;
@@ -65,6 +67,20 @@ export interface OpenPetsClient {
 }
 
 export function createOpenPetsClient(options: OpenPetsClientOptions = {}): OpenPetsClient {
+  if (shouldUseTermuxBackend()) {
+    return {
+      hello: async () => ({ ok: true, protocol: "openpets-termux", protocolVersion: 1, backend: "termux" }),
+      status: async (statusOptions) => getTermuxBackendStatus(statusOptions?.leaseId) as OpenPetsStatusResult,
+      listPets: async () => ({ ok: true, defaultPetId: "termux-notification", pets: [{ id: "termux-notification", displayName: "Termux Notifications", builtIn: true, broken: false }] }),
+      installPet: async (_petId) => { throw new OpenPetsClientError("unknown_method", "Pet installation is unavailable in Termux notification backend."); },
+      acquireLease: async (leaseOptions) => acquireTermuxLease(leaseOptions?.requestedPetId),
+      heartbeatLease: async (leaseId) => heartbeatTermuxLease(leaseId),
+      releaseLease: async (leaseId) => releaseTermuxLease(leaseId),
+      react: async (reaction, _reactOptions) => sendTermuxReaction(validateReaction(reaction)),
+      say: async (message, sayOptions) => sendTermuxMessage(message, sayOptions?.reaction),
+    };
+  }
+
   return {
     hello: () => sendDiscoveredRequest("hello", {}, options),
     status: async (statusOptions) => {

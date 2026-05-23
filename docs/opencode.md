@@ -191,6 +191,15 @@ Linux: $XDG_RUNTIME_DIR/openpets/ipc.json, or ~/.config/OpenPets/runtime/ipc.jso
 
 That file contains the IPC endpoint and a per-run token. Clients must send that token with every request.
 
+### Termux notification backend
+
+When OpenCode runs in Termux/Android, OpenPets MCP can use Termux notifications as the output backend instead of desktop IPC.
+
+- Pass `--backend termux` to `openpets mcp`, or set `OPENPETS_BACKEND=termux`.
+- `openpets_status` reports `backend: "termux"` and healthy local status when notifications are available.
+- `openpets_react` and `openpets_say` map to `termux-notification` updates.
+- `--backend ipc` forces desktop IPC behavior.
+
 ## MCP tools
 
 OpenCode sees these tools when the MCP entry is enabled:

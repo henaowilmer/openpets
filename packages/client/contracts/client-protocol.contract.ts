@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { parseIpcEndpoint, validateDiscovery } from "../src/discovery.js";
 import { parsePetInstallResult, parsePetListResult } from "../src/index.js";
 import { OpenPetsClientError, parseIpcResponse, validateReaction } from "../src/protocol.js";
+import { isTermuxEnvironment, shouldUseTermuxBackend } from "../src/termux-backend.js";
 
 const baseDiscovery = {
   protocolVersion: 1,
@@ -11,7 +12,7 @@ const baseDiscovery = {
   token: "x".repeat(32),
   appVersion: "0.0.0",
   pid: 123,
-  platform: process.platform,
+  platform: process.platform === "android" ? "linux" : process.platform,
 };
 
 validateDiscovery(baseDiscovery);
@@ -66,6 +67,13 @@ assert.deepEqual(parsePetListResult({ ok: true, defaultPetId: "builtin", pets: [
 assertRejects(() => parsePetListResult({ ok: true, pets: [{ id: "fixer" }], defaultPetId: "builtin" }));
 assert.deepEqual(parsePetInstallResult({ ok: true, petId: "fixer", displayName: "Fixer", installed: true }), { ok: true, petId: "fixer", displayName: "Fixer", installed: true });
 assertRejects(() => parsePetInstallResult({ ok: true, petId: "fixer" }));
+
+assert.equal(isTermuxEnvironment({ TERMUX_VERSION: "0.118.0" } as NodeJS.ProcessEnv), true);
+assert.equal(isTermuxEnvironment({} as NodeJS.ProcessEnv), false);
+assert.equal(shouldUseTermuxBackend({ OPENPETS_BACKEND: "termux" } as NodeJS.ProcessEnv), true);
+assert.equal(shouldUseTermuxBackend({ OPENPETS_BACKEND: "ipc" } as NodeJS.ProcessEnv), false);
+assert.equal(shouldUseTermuxBackend({ TERMUX_VERSION: "0.118.0" } as NodeJS.ProcessEnv), true);
+assert.equal(shouldUseTermuxBackend({} as NodeJS.ProcessEnv), false);
 
 console.log("Client protocol validation passed.");
 
