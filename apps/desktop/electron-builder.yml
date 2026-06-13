@@ -10,11 +10,17 @@ artifactName: OpenPets-${version}-${os}-${arch}.${ext}
 
 files:
   - dist/**
-  - preload.cjs
+  - control-center-preload.cjs
   - pet-preload.cjs
   - plugin-sdk-preload.cjs
+  - plugin-command-form-preload.cjs
+  - panel-preload.cjs
   - assets/**
   - package.json
+
+extraResources:
+  - from: ../../plugins/official
+    to: plugins/official
 
 asar: true
 asarUnpack:

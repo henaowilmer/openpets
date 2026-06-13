@@ -2,20 +2,27 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { OPENPETS_PLUGIN_MANIFEST_FILENAME, type OpenPetsDeclarativePluginManifest } from "../src/plugin-manifest.js";
-import { PluginService } from "../src/plugin-service.js";
+import { PluginService, executeDefaultPetPluginCommand, getDefaultPetPluginCommands, setPluginServiceForTests, stopPluginService } from "../src/plugin-service.js";
 import { PluginStateStore, type PluginStateRecord } from "../src/plugin-state.js";
 
 let lastRoot = "";
 
 class FakeRuntime {
   reloads: string[] = [];
+  logs: Array<{ level: string; message: string; fields?: Record<string, unknown> }> = [];
+  commandState: Record<string, Array<{ id: string; title: string; description?: string; form?: { submitLabel?: string; fields: Array<{ id: string; type: string; label: string }> } }>> = {};
+  executed: Array<{ pluginId: string; commandId: string }> = [];
+  commandError: Error | null = null;
   stopped = false;
   async start(): Promise<void> {}
   stop(): void { this.stopped = true; }
   async reloadPlugin(id: string): Promise<void> { this.reloads.push(id); }
+  getPluginState(id: string): { commands: Array<{ id: string; title: string; description?: string; form?: { submitLabel?: string; fields: Array<{ id: string; type: string; label: string }> } }> } { return { commands: this.commandState[id] ?? [] }; }
+  async executeCommand(pluginId: string, commandId: string): Promise<void> { this.executed.push({ pluginId, commandId }); if (this.commandError) throw this.commandError; }
+  log(level: string, message: string, fields?: Record<string, unknown>): void { this.logs.push({ level, message, fields }); }
 }
 
 class ThrowingStateStore extends PluginStateStore {
@@ -30,7 +37,7 @@ class ThrowingStateStore extends PluginStateStore {
 }
 
 await scenario("initializes store and roots", async ({ userData }) => {
-  const service = new PluginService({ userDataPath: userData, petApi: { speak() {}, react() {} } });
+  const service = new PluginService({ userDataPath: userData, petApi: { speak() {}, react() {}, moveBy() {}, wander() {}, moveToHome() {} } });
   await service.start();
   assert.equal(existsSync(join(userData, "plugins")), true);
   assert.equal(existsSync(join(userData, "plugins-dev")), true);
@@ -47,10 +54,21 @@ await scenario("snapshot omits paths and includes manifest config", async ({ ser
   assert.equal("installPath" in snapshot.plugins[0], false);
 });
 
+await scenario("snapshot exposes declared v3 svg icon data url", async ({ root, service, store }) => {
+  const installPath = join(root, "openpets.reminders");
+  mkdirSync(join(installPath, "assets"), { recursive: true });
+  writeFileSync(join(installPath, "index.js"), "export default {};", "utf8");
+  writeFileSync(join(installPath, "assets", "reminders.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"10\"/></svg>", "utf8");
+  addPlugin(store, { id: "openpets.reminders", version: "1.0.0", installPath }, { manifestVersion: 3, id: "openpets.reminders", name: "Reminders", version: "1.0.0", runtime: "javascript", sdkVersion: "3.0.0", entry: "index.js", icon: "bell", permissions: [], assets: { icons: { reminders: "assets/reminders.svg" } } });
+  const snapshot = await service.getSnapshot();
+  assert.match(snapshot.plugins[0].iconDataUrl ?? "", /^data:image\/svg\+xml;base64,/);
+  assert.equal(Buffer.from((snapshot.plugins[0].iconDataUrl ?? "").split(",")[1] ?? "", "base64").toString("utf8").includes("<svg"), true);
+});
+
 await scenario("invalid manifest appears safe broken", async ({ service, store }) => {
   addPlugin(store, {}, { bad: true });
   const snapshot = await service.getSnapshot();
-  assert.equal(snapshot.plugins[0].brokenReason, "Plugin manifest validation failed.");
+  assert.match(snapshot.plugins[0].brokenReason ?? "", /Plugin manifest validation failed: .*unknown_field/);
 });
 
 await scenario("missing manifest does not leak absolute paths", async ({ service, store, root }) => {
@@ -58,7 +76,8 @@ await scenario("missing manifest does not leak absolute paths", async ({ service
   store.upsertRecord({ id: "missing", version: "1.0.0", manifestPath: missingPath, installPath: join(root, "missing"), source: "local", enabled: true, approvedPermissions: ["timer"], config: {} });
   const snapshot = await service.getSnapshot();
   const reason = snapshot.plugins[0].brokenReason ?? "";
-  assert.equal(reason, "Plugin manifest is unavailable.");
+  assert.match(reason, /ENOENT/);
+  assert.match(reason, /\[path\]/);
   assert.equal(reason.includes(root), false);
 });
 
@@ -84,6 +103,62 @@ await scenario("config save replaces and reloads", async ({ service, store, runt
   assert.deepEqual(runtime.reloads, ["plug"]);
 });
 
+await scenario("config save reload preserves plugin user sounds", async ({ root, userData, store, runtime }) => {
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, allowedPluginRoots: [root] });
+  addPlugin(store, { manifestVersion: 3, runtime: "javascript", sdkVersion: "3.0.0", config: { customSound: { kind: "user-sound", id: "a".repeat(32), name: "Bell" } } }, { manifestVersion: 3, id: "plug", name: "Plug", version: "1.0.0", runtime: "javascript", sdkVersion: "3.0.0", entry: "index.js", permissions: [], configSchema: { customSound: { type: "sound" } } });
+  const soundDir = join(userData, "plugin-user-sounds", "plug");
+  const soundPath = join(soundDir, `${"a".repeat(32)}.ogg`);
+  mkdirSync(soundDir, { recursive: true });
+  writeFileSync(soundPath, "sound");
+  const result = await service.saveConfig("plug", { customSound: { kind: "user-sound", id: "a".repeat(32), name: "Bell" } });
+  assert.equal(result.ok, true);
+  assert.deepEqual(runtime.reloads, ["plug"]);
+  assert.equal(existsSync(soundPath), true);
+});
+
+await scenario("pickConfigSound logs stages and useful unsupported format error", async ({ root, store, runtime }) => {
+  const selectedPath = join(root, "tone.flac");
+  writeFileSync(selectedPath, "sound");
+  const service = new PluginService({
+    stateStore: store,
+    runtime: runtime as never,
+    allowedPluginRoots: [root],
+    showSoundOpenDialog: async () => ({ canceled: false, filePaths: [selectedPath] }),
+    capabilities: { audio: { importUserSoundFromPath: async () => { throw new Error("Plugin sound format is not supported."); } } } as never,
+  });
+  addPlugin(store, { manifestVersion: 3, runtime: "javascript", sdkVersion: "3.0.0" }, { manifestVersion: 3, id: "plug", name: "Plug", version: "1.0.0", runtime: "javascript", sdkVersion: "3.0.0", entry: "index.js", permissions: [], configSchema: { customSound: { type: "sound" } } });
+  const result = await service.pickConfigSound("plug");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "Plugin sound format is not supported.");
+  assert.equal(runtime.logs.some((entry) => entry.message === "Plugin config sound pick requested." && entry.fields?.pluginId === "plug"), true);
+  assert.equal(runtime.logs.some((entry) => entry.message === "Plugin config sound picker opened."), true);
+  const selectedLog = runtime.logs.find((entry) => entry.message === "Plugin config sound file selected.");
+  assert.equal(selectedLog?.fields?.basename, basename(selectedPath));
+  assert.equal(selectedLog?.fields?.ext, ".flac");
+  assert.equal(selectedLog?.fields?.sizeBytes, 5);
+  assert.equal(Object.values(selectedLog?.fields ?? {}).some((value) => typeof value === "string" && value.includes(root)), false);
+  assert.equal(runtime.logs.some((entry) => entry.message === "Plugin config sound import failed." && entry.fields?.reason === "Plugin sound format is not supported."), true);
+});
+
+await scenario("pickConfigSound returns opaque sound and logs success", async ({ root, store, runtime }) => {
+  const selectedPath = join(root, "ding.ogg");
+  writeFileSync(selectedPath, "sound");
+  const service = new PluginService({
+    stateStore: store,
+    runtime: runtime as never,
+    allowedPluginRoots: [root],
+    showSoundOpenDialog: async () => ({ canceled: false, filePaths: [selectedPath] }),
+    capabilities: { audio: { importUserSoundFromPath: async (pluginId: string, path: string) => ({ kind: "user-sound", id: "abc123", name: basename(path) }) } } as never,
+  });
+  addPlugin(store, { manifestVersion: 3, runtime: "javascript", sdkVersion: "3.0.0" }, { manifestVersion: 3, id: "plug", name: "Plug", version: "1.0.0", runtime: "javascript", sdkVersion: "3.0.0", entry: "index.js", permissions: [], configSchema: { customSound: { type: "sound" } } });
+  const result = await service.pickConfigSound("plug");
+  assert.equal(result.ok, true);
+  assert.equal("sound" in result, true);
+  if (!("sound" in result)) throw new Error("Expected picked sound result.");
+  assert.deepEqual(result.sound, { kind: "user-sound", id: "abc123", name: "ding.ogg" });
+  assert.equal(runtime.logs.some((entry) => entry.message === "Plugin config sound import succeeded." && entry.fields?.pluginId === "plug" && entry.fields?.soundId === "abc123" && entry.fields?.name === "ding.ogg"), true);
+});
+
 await scenario("enable disable persists and reloads", async ({ service, store, runtime }) => {
   addPlugin(store, { enabled: false });
   const result = await service.setEnabled("plug", true);
@@ -98,19 +173,34 @@ await scenario("reload unknown is safe error", async ({ service }) => {
   assert.match(result.error, /not installed/);
 });
 
+await scenario("uninstall clears plugin user sounds", async ({ userData, root, store }) => {
+  mkdirSync(join(userData, "plugins"), { recursive: true });
+  mkdirSync(join(userData, "plugins-dev"), { recursive: true });
+  const runtime = new FakeRuntime();
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, allowedPluginRoots: [root] });
+  addPlugin(store, { source: "catalog", installPath: join(userData, "plugins", "plug") });
+  const soundDir = join(userData, "plugin-user-sounds", "plug");
+  mkdirSync(soundDir, { recursive: true });
+  writeFileSync(join(soundDir, "a".repeat(32) + ".ogg"), "sound");
+  const result = await service.uninstall("plug");
+  assert.equal(result.ok, true);
+  assert.equal(existsSync(soundDir), false);
+});
+
 await scenario("stop cancels runtime", async ({ service, runtime }) => {
   service.stop();
   assert.equal(runtime.stopped, true);
 });
 
-await localScenario("loadLocal snapshots manifest disabled", async ({ service, store, source }) => {
+await localScenario("loadLocal snapshots manifest enabled", async ({ service, store, runtime, source }) => {
   writeManifest(source, manifest({ id: "local-plug", permissions: ["timer", "pet:speak"] }));
   const result = await service.loadLocal();
   assert.equal(result.ok, true);
   const record = store.getRecord("local-plug");
-  assert.equal(record?.enabled, false);
+  assert.equal(record?.enabled, true);
   assert.equal(record?.source, "local");
   assert.deepEqual(record?.approvedPermissions, ["pet:speak", "timer"]);
+  assert.deepEqual(runtime.reloads, ["local-plug"]);
   assert.equal(existsSync(join(record?.installPath ?? "", OPENPETS_PLUGIN_MANIFEST_FILENAME)), true);
   assert.equal("installPath" in result.snapshot.plugins[0], false);
 });
@@ -148,7 +238,7 @@ await localScenario("loadLocal rejects invalid manifest safely", async ({ servic
   const result = await service.loadLocal();
   assert.equal(result.ok, false);
   assert.equal(result.error.includes(root), false);
-  assert.equal(result.error, "Plugin manifest validation failed.");
+  assert.match(result.error, /Plugin manifest validation failed: .*unknown_field/);
 });
 
 await localScenario("loadLocal rejects source symlink", async ({ service, source, root }) => {
@@ -201,14 +291,14 @@ await localScenario("loadLocal rejects destination symlink before write", async 
   assert.equal(existsSync(join(outside, OPENPETS_PLUGIN_MANIFEST_FILENAME)), false);
 });
 
-await localScenario("loadLocal permission change disables", async ({ service, store, source, userData }) => {
+await localScenario("loadLocal permission change preserves enabled after approval", async ({ service, store, source, userData }) => {
   writeManifest(source, manifest({ id: "perm-plug", permissions: ["timer", "pet:speak", "pet:reaction"], triggers: [{ on: "timer", everyMinutes: 5, actions: [{ type: "pet.react", reaction: "celebrating" }] }] }));
   const install = join(userData, "plugins-dev", "perm-plug");
   const manifestPath = writeManifest(install, manifest({ id: "perm-plug", permissions: ["timer", "pet:speak"] }));
   store.upsertRecord({ id: "perm-plug", version: "1.0.0", installPath: install, manifestPath, source: "local", enabled: true, approvedPermissions: ["timer", "pet:speak"], config: {} });
   const result = await service.loadLocal();
   assert.equal(result.ok, true);
-  assert.equal(store.getRecord("perm-plug")?.enabled, false);
+  assert.equal(store.getRecord("perm-plug")?.enabled, true);
   assert.deepEqual(store.getRecord("perm-plug")?.approvedPermissions, ["pet:speak", "pet:reaction", "timer"]);
   assert.deepEqual(service["__runtimeReloads"], ["perm-plug"]);
 });
@@ -238,6 +328,156 @@ await localScenario("loadLocal snapshots javascript entry", async ({ service, so
   const install = store.getRecord("js-local")?.installPath ?? join(userData, "plugins-dev", "js-local");
   assert.equal(existsSync(join(install, OPENPETS_PLUGIN_MANIFEST_FILENAME)), true);
   assert.equal(readFileSync(join(install, "index.mjs"), "utf8"), "export default {};\n");
+});
+
+await localScenario("loadLocal snapshots v3 locale catalogs for translated UI", async ({ service, source, store, userData, runtime }) => {
+  writeManifest(source, {
+    manifestVersion: 3,
+    id: "i18n-local",
+    name: "$t:plugin.name",
+    description: "$t:plugin.description",
+    version: "1.0.0",
+    runtime: "javascript",
+    sdkVersion: "3.0.0",
+    entry: "index.js",
+    permissions: ["pet:speak"],
+    configSchema: {
+      enabled: { type: "boolean", default: true, label: "$t:config.enabled.label", description: "$t:config.enabled.description" },
+    },
+  });
+  writeFileSync(join(source, "index.js"), "OpenPetsPlugin.register({ start() {} });\n", "utf8");
+  mkdirSync(join(source, "locales"), { recursive: true });
+  writeFileSync(join(source, "locales", "en.json"), JSON.stringify({
+    "plugin.name": "Translated Plugin",
+    "plugin.description": "Translated description.",
+    "config.enabled.label": "Translated toggle",
+    "config.enabled.description": "Translated toggle description.",
+    "command.run.title": "Translated command",
+    "command.run.description": "Translated command description.",
+    "command.run.submit": "Translated submit",
+    "form.message.label": "Translated message",
+  }), "utf8");
+
+  const result = await service.loadLocal();
+  assert.equal(result.ok, true);
+  const install = store.getRecord("i18n-local")?.installPath ?? join(userData, "plugins-dev", "i18n-local");
+  assert.equal(existsSync(join(install, "locales", "en.json")), true);
+  const plugin = result.snapshot.plugins[0];
+  assert.equal(plugin.name, "Translated Plugin");
+  assert.equal(plugin.description, "Translated description.");
+  assert.equal(plugin.configSchema?.enabled?.label, "Translated toggle");
+  assert.equal(plugin.configSchema?.enabled?.description, "Translated toggle description.");
+
+  runtime.commandState["i18n-local"] = [{ id: "run", title: "$t:command.run.title", description: "$t:command.run.description", form: { submitLabel: "$t:command.run.submit", fields: [{ id: "message", type: "text", label: "$t:form.message.label" }] } } as never];
+  const refreshed = (await service.getSnapshot()).plugins[0];
+  assert.equal(refreshed.commands?.[0]?.title, "Translated command");
+  assert.equal(refreshed.commands?.[0]?.description, "Translated command description.");
+  assert.equal(refreshed.commands?.[0]?.form?.submitLabel, "Translated submit");
+  assert.equal(refreshed.commands?.[0]?.form?.fields[0]?.label, "Translated message");
+});
+
+await localScenario("bundled seeding copies manifest and preserves user choices", async ({ userData, root, store }) => {
+  const official = join(root, "official");
+  const source = join(official, "openpets.reminders");
+  writeManifest(source, { manifestVersion: 2, id: "openpets.reminders", name: "Quick Reminders", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["pet:speak"], configSchema: { minutes: { type: "number", default: 30 } } });
+  writeFileSync(join(source, "index.js"), "OpenPetsPlugin.register({ start() {} });\n", "utf8");
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: new FakeRuntime() as never, bundledPluginSourceDirs: [official] });
+  await service.start();
+  let record = store.getRecord("openpets.reminders");
+  assert.equal(record?.source, "catalog");
+  assert.equal(record?.bundled, true);
+  assert.equal(record?.enabled, true);
+  assert.equal(readFileSync(join(record?.installPath ?? "", "index.js"), "utf8"), "OpenPetsPlugin.register({ start() {} });\n");
+  store.replaceConfig("openpets.reminders", { minutes: 45 });
+  store.setEnabled("openpets.reminders", false);
+  writeManifest(source, { manifestVersion: 2, id: "openpets.reminders", name: "Quick Reminders", version: "2.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["pet:speak", "pet:reaction"] });
+  await service.seedBundledPlugins();
+  record = store.getRecord("openpets.reminders");
+  assert.equal(record?.version, "2.0.0");
+  assert.equal(record?.enabled, false);
+  assert.deepEqual(record?.config, { minutes: 45 });
+  assert.deepEqual(record?.approvedPermissions, ["pet:speak", "pet:reaction"]);
+});
+
+await localScenario("bundled seeding prunes stale ids and blocks uninstall update", async ({ userData, root, store }) => {
+  const oldInstall = join(userData, "plugins", "openpets.pomodoro");
+  const oldManifest = writeManifest(oldInstall, manifest({ id: "openpets.pomodoro" }));
+  store.upsertRecord({ id: "openpets.pomodoro", version: "1.0.0", installPath: oldInstall, manifestPath: oldManifest, source: "catalog", enabled: true, approvedPermissions: ["timer", "pet:speak"], config: {} });
+  const official = join(root, "official");
+  const source = join(official, "openpets.reminders");
+  writeManifest(source, { manifestVersion: 2, id: "openpets.reminders", name: "Quick Reminders", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["network"], network: { hosts: ["api.github.com"] } });
+  writeFileSync(join(source, "index.js"), "OpenPetsPlugin.register({ start() {} });\n", "utf8");
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: new FakeRuntime() as never, bundledPluginSourceDirs: [official] });
+  await service.start();
+  assert.equal(store.getRecord("openpets.pomodoro"), undefined);
+  assert.equal(store.getRecord("openpets.reminders")?.enabled, true);
+  assert.deepEqual(store.getRecord("openpets.reminders")?.approvedNetworkHosts, ["api.github.com"]);
+  assert.equal((await service.uninstall("openpets.reminders")).ok, false);
+  const update = await service.updateCatalog("openpets.reminders");
+  assert.equal(update.ok, false);
+  assert.match(update.error, /Bundled plugins update/);
+});
+
+await localScenario("bundled seeding prunes stale local old ids", async ({ userData, store }) => {
+  const oldInstall = join(userData, "plugins-dev", "openpets.daily-reminders");
+  const oldManifest = writeManifest(oldInstall, manifest({ id: "openpets.daily-reminders" }));
+  store.upsertRecord({ id: "openpets.daily-reminders", version: "1.0.0", installPath: oldInstall, manifestPath: oldManifest, source: "local", enabled: true, approvedPermissions: ["timer", "pet:speak"], config: {} });
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: new FakeRuntime() as never, bundledPluginSourceDirs: [] });
+  await service.seedBundledPlugins();
+  assert.equal(store.getRecord("openpets.daily-reminders"), undefined);
+  assert.equal(existsSync(oldInstall), false);
+});
+
+await localScenario("bundled stale prune refuses unsafe path", async ({ userData, root, store }) => {
+  const outside = join(root, "outside-stale");
+  mkdirSync(outside, { recursive: true });
+  const link = join(userData, "plugins", "openpets.pomodoro");
+  symlinkSync(outside, link, "dir");
+  store.upsertRecord({ id: "openpets.pomodoro", version: "1.0.0", installPath: link, manifestPath: join(link, OPENPETS_PLUGIN_MANIFEST_FILENAME), source: "catalog", enabled: true, approvedPermissions: ["timer", "pet:speak"], config: {} });
+  const runtime = new FakeRuntime();
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, bundledPluginSourceDirs: [] });
+  await service.seedBundledPlugins();
+  assert.equal(store.getRecord("openpets.pomodoro")?.id, "openpets.pomodoro");
+  assert.equal(existsSync(outside), true);
+  assert.equal(runtime.logs.some((entry) => entry.message.includes("Refused to prune")), true);
+});
+
+await localScenario("bundled seeding rejects plugins root symlink", async ({ userData, root, store }) => {
+  rmSync(join(userData, "plugins"), { recursive: true, force: true });
+  const outsideRoot = join(root, "outside-plugins");
+  mkdirSync(outsideRoot, { recursive: true });
+  symlinkSync(outsideRoot, join(userData, "plugins"), "dir");
+  const official = join(root, "official");
+  const source = join(official, "openpets.reminders");
+  writeManifest(source, { manifestVersion: 2, id: "openpets.reminders", name: "Quick Reminders", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["pet:speak"] });
+  writeFileSync(join(source, "index.js"), "OpenPetsPlugin.register({ start() {} });\n", "utf8");
+  const runtime = new FakeRuntime();
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, bundledPluginSourceDirs: [official] });
+  await service.seedBundledPlugins();
+  assert.equal(store.getRecord("openpets.reminders"), undefined);
+  assert.equal(existsSync(join(outsideRoot, "openpets.reminders")), false);
+  assert.equal(runtime.logs.some((entry) => entry.message.includes("Bundled plugin seed failed")), true);
+});
+
+await localScenario("start skips bundled seeding when disabled", async ({ userData, root, store }) => {
+  const official = join(root, "official");
+  const source = join(official, "openpets.reminders");
+  writeManifest(source, { manifestVersion: 2, id: "openpets.reminders", name: "Quick Reminders", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["pet:speak"] });
+  writeFileSync(join(source, "index.js"), "OpenPetsPlugin.register({ start() {} });\n", "utf8");
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: new FakeRuntime() as never, bundledPluginSourceDirs: [official], seedBundledPlugins: false });
+  await service.start();
+  assert.equal(store.getRecord("openpets.reminders"), undefined);
+});
+
+await scenario("catalog metadata ignores bundled records", async ({ userData, store, runtime }) => {
+  const install = join(userData, "plugins", "openpets.break-buddy");
+  const manifestPath = writeManifest(install, manifest({ id: "openpets.break-buddy" }));
+  store.upsertRecord({ id: "openpets.break-buddy", version: "1.0.0", installPath: install, manifestPath, source: "catalog", bundled: true, enabled: true, approvedPermissions: ["timer", "pet:speak"], config: {} });
+  const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), plugins: [{ ...catalogEntry("openpets.break-buddy", "1.0.0"), disabled: true, statusReason: "disabled" }] }), { status: 200 });
+  const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, fetchImpl });
+  await service.getCatalogSnapshot(true);
+  assert.equal(store.getRecord("openpets.break-buddy")?.enabled, true);
+  assert.equal(store.getRecord("openpets.break-buddy")?.catalogDisabled, undefined);
 });
 
 await localScenario("loadLocalPath auto-approves explicit dev path", async ({ service, source, store }) => {
@@ -326,6 +566,20 @@ await localScenario("uninstall removes state reloads and rejects symlink deletio
   assert.equal(store.getRecord("root-link")?.id, "root-link");
 });
 
+await localScenario("uninstall removes stale local record when dev snapshot is missing", async ({ service, store, runtime, userData }) => {
+  const install = join(userData, "plugins-dev", "stale-local");
+  store.upsertRecord({ id: "stale-local", version: "1.0.0", installPath: install, manifestPath: join(install, OPENPETS_PLUGIN_MANIFEST_FILENAME), source: "local", enabled: true, brokenReason: "ENOENT: missing manifest", approvedPermissions: ["pet:speak", "schedule"], config: {} });
+  const result = await service.uninstall("stale-local");
+  assert.equal(result.ok, true);
+  assert.equal(store.getRecord("stale-local"), undefined);
+  assert.deepEqual(runtime.reloads, ["stale-local"]);
+
+  store.upsertRecord({ id: "outside-missing", version: "1.0.0", installPath: join(userData, "plugins-dev", "..", "outside-missing"), manifestPath: join(userData, "plugins-dev", "..", "outside-missing", OPENPETS_PLUGIN_MANIFEST_FILENAME), source: "local", enabled: true, brokenReason: "missing", approvedPermissions: ["pet:speak"], config: {} });
+  const rejected = await service.uninstall("outside-missing");
+  assert.equal(rejected.ok, false);
+  assert.equal(store.getRecord("outside-missing")?.id, "outside-missing");
+});
+
 await catalogRollbackScenario("catalog update rolls back manifest if state write fails", async ({ service, store, runtime, userData }) => {
   const oldManifest = manifest({ id: "rollback-plug", version: "1.0.0" });
   const install = join(userData, "plugins", "rollback-plug");
@@ -345,7 +599,7 @@ await catalogCompatibilityScenario("catalog filters and blocks incompatible plug
   assert.deepEqual(snapshot.plugins.map((plugin) => plugin.id), ["compatible-plug"]);
   const result = await service.installCatalog("future-plug");
   assert.equal(result.ok, false);
-  assert.match(result.error, /newer OpenPets/);
+  assert.match(result.error, /incompatible with this OpenPets version/);
 });
 
 await scenario("disabled catalog returns no discover plugins", async ({ userData, store, runtime }) => {
@@ -353,6 +607,34 @@ await scenario("disabled catalog returns no discover plugins", async ({ userData
   const service = new PluginService({ userDataPath: userData, stateStore: store, runtime: runtime as never, fetchImpl, disableCatalog: true });
   const snapshot = await service.getCatalogSnapshot(true);
   assert.deepEqual(snapshot.plugins, []);
+});
+
+await scenario("right-click command helper groups caps and ignores stale commands", async ({ runtime }) => {
+  setPluginServiceForTests({
+    getSnapshot: async () => ({ plugins: [
+      { id: "zeta", name: "Zeta", version: "1.0.0", source: "catalog", enabled: true, approvedPermissions: [], commands: [{ id: "b", title: "Beta" }, { id: "a", title: "Alpha" }, { id: "c", title: "Gamma" }] },
+      { id: "alpha", name: "Alpha", version: "1.0.0", source: "catalog", enabled: true, approvedPermissions: [], commands: [{ id: "run", title: "Run" }] },
+      { id: "disabled", name: "Disabled", version: "1.0.0", source: "catalog", enabled: false, approvedPermissions: [], commands: [{ id: "run", title: "Run" }] },
+      { id: "broken", name: "Broken", version: "1.0.0", source: "catalog", enabled: true, brokenReason: "broken", approvedPermissions: [], commands: [{ id: "run", title: "Run" }] },
+    ] }),
+    executeCommand: async (pluginId: string, commandId: string) => { runtime.executed.push({ pluginId, commandId }); },
+    stop() {},
+  } as unknown as PluginService);
+  const commands = await getDefaultPetPluginCommands(2, 2);
+  assert.deepEqual(commands.map((command) => `${command.pluginId}:${command.commandId}`), ["alpha:run", "zeta:b", "zeta:a"]);
+  setPluginServiceForTests({ getSnapshot: async () => ({ plugins: [{ id: "alpha", name: "Alpha", version: "1.0.0", source: "catalog", enabled: true, approvedPermissions: [], commands: [{ id: "run", title: "Run" }] }, { id: "zeta", name: "Zeta", version: "1.0.0", source: "catalog", enabled: true, approvedPermissions: [], commands: [] }] }), executeCommand: async (pluginId: string, commandId: string) => { runtime.executed.push({ pluginId, commandId }); }, stop() {} } as unknown as PluginService);
+  assert.deepEqual((await getDefaultPetPluginCommands()).map((command) => command.pluginId), ["alpha"]);
+  await executeDefaultPetPluginCommand("alpha", "run");
+  assert.deepEqual(runtime.executed, [{ pluginId: "alpha", commandId: "run" }]);
+  stopPluginService();
+});
+
+await scenario("executeCommand returns plugin command validation errors", async ({ service, store, runtime }) => {
+  addPlugin(store);
+  runtime.commandError = new Error("Message is required.");
+  const result = await service.executeCommand("plug", "set-reminder");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "Message is required.");
 });
 
 console.error("Plugin service validation passed.");
@@ -424,7 +706,15 @@ function addPlugin(store: PluginStateStore, patch: Partial<PluginStateRecord> = 
   const id = patch.id ?? "plug";
   const installPath = patch.installPath ?? join(currentRootFromStore(store), id);
   const manifestPath = patch.manifestPath ?? writeManifest(installPath, data);
-  store.upsertRecord({ id, version: patch.version ?? "1.0.0", manifestPath, installPath, source: patch.source ?? "local", enabled: patch.enabled ?? true, approvedPermissions: patch.approvedPermissions ?? ["timer", "pet:speak"], config: patch.config ?? {}, brokenReason: patch.brokenReason });
+  store.upsertRecord({ id, version: patch.version ?? "1.0.0", manifestPath, installPath, source: patch.source ?? "local", bundled: patch.bundled, enabled: patch.enabled ?? true, approvedPermissions: patch.approvedPermissions ?? ["timer", "pet:speak"], config: patch.config ?? {}, brokenReason: patch.brokenReason });
+}
+
+function addCommandPlugin(store: PluginStateStore, userData: string, id: string, name: string, _commands: Array<{ id: string; title: string }>, patch: Partial<PluginStateRecord> = {}): void {
+  const data = manifest({ id, permissions: ["timer", "pet:speak"] });
+  data.name = name;
+  const installPath = join(userData, "plugins", id);
+  const manifestPath = writeManifest(installPath, data);
+  store.upsertRecord({ id, version: "1.0.0", manifestPath, installPath, source: "catalog", enabled: patch.enabled ?? true, approvedPermissions: ["timer", "pet:speak"], config: {}, brokenReason: patch.brokenReason });
 }
 
 function currentRootFromStore(_store: PluginStateStore): string { return lastRoot; }

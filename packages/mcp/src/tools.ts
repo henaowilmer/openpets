@@ -71,15 +71,31 @@ export async function handleStatus(context: ToolContext): Promise<CallToolResult
   };
 }
 
+async function ensureLease(context: ToolContext): Promise<boolean> {
+  if (context.lease?.lease) return true;
+  try {
+    const client = context.client ?? createOpenPetsClient();
+    const newLease = await client.acquireLease({ requestedPetId: context.configuredPetId });
+    if (context.lease) {
+      context.lease.lease = newLease;
+      context.lease.staleLeaseId = undefined;
+      context.lease.degradedReason = undefined;
+    }
+    return !!newLease;
+  } catch {
+    return false;
+  }
+}
+
 export async function handleReact(input: unknown, context: ToolContext): Promise<CallToolResult> {
   await context.leaseReady;
   const parsed = reactSchema.safeParse(input);
   if (!parsed.success) return toolError("Invalid reaction. Use one of: " + allowedReactions.join(", "));
-  if (!context.lease?.lease) return toolError(`OpenPets lease is unavailable. ${sanitizeUnavailableReason(context.lease?.degradedReason) ?? "Open OpenPets and try again."}`);
+  if (!(await ensureLease(context))) return toolError(`OpenPets lease is unavailable. ${sanitizeUnavailableReason(context.lease?.degradedReason) ?? "Open OpenPets and try again."}`);
 
   try {
     const client = context.client ?? createOpenPetsClient();
-    const result = await client.react(parsed.data.reaction, { leaseId: context.lease.lease.leaseId });
+    const result = await client.react(parsed.data.reaction, { leaseId: context.lease!.lease!.leaseId });
     return {
       content: [{ type: "text", text: `OpenPets reaction sent: ${parsed.data.reaction}` }],
       structuredContent: { ok: true, reaction: parsed.data.reaction, result },
@@ -93,11 +109,11 @@ export async function handleSay(input: unknown, context: ToolContext): Promise<C
   await context.leaseReady;
   const parsed = saySchema.safeParse(input);
   if (!parsed.success) return toolError("Invalid message. Keep it short, single-line, and avoid code, secrets, URLs, and file paths.");
-  if (!context.lease?.lease) return toolError(`OpenPets lease is unavailable. ${sanitizeUnavailableReason(context.lease?.degradedReason) ?? "Open OpenPets and try again."}`);
+  if (!(await ensureLease(context))) return toolError(`OpenPets lease is unavailable. ${sanitizeUnavailableReason(context.lease?.degradedReason) ?? "Open OpenPets and try again."}`);
 
   try {
     const client = context.client ?? createOpenPetsClient();
-    const result = await client.say(parsed.data.message, { reaction: parsed.data.reaction, leaseId: context.lease.lease.leaseId });
+    const result = await client.say(parsed.data.message, { reaction: parsed.data.reaction, leaseId: context.lease!.lease!.leaseId });
     return {
       content: [{ type: "text", text: "OpenPets message sent." }],
       structuredContent: { ok: true, result },

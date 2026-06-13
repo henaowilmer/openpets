@@ -32,7 +32,10 @@ const validManifest = {
 };
 
 assertValid(validManifest);
-assertValid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "dist/index.js", permissions: ["pet:speak", "network"], network: { hosts: ["api.example.com"] } });
+assertValid({ ...validManifest, icon: "bell" });
+assertInvalid({ ...validManifest, icon: "https://example.com/icon.svg" }, "invalid_icon");
+assertValid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "javascript", icon: "github", sdkVersion: "1.0.0", entry: "dist/index.js", permissions: ["pet:speak", "network"], network: { hosts: ["api.example.com"] } });
+assertInvalid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "javascript", icon: "<svg>", sdkVersion: "1.0.0", entry: "dist/index.js", permissions: ["pet:speak"] }, "invalid_icon");
 assertInvalid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "declarative", sdkVersion: "1.0.0", entry: "dist/index.js", permissions: ["pet:speak"] }, "invalid_runtime");
 assertInvalid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "../index.js", permissions: ["pet:speak"] }, "invalid_entry");
 assertInvalid({ manifestVersion: 2, id: "js-plugin", name: "JS Plugin", version: "1.0.0", runtime: "javascript", sdkVersion: "1.0.0", entry: "index.js", permissions: ["network"], network: { hosts: ["*.example.com"] } }, "invalid_network_host");

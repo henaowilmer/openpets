@@ -1,6 +1,6 @@
-import { createWriteStream } from "node:fs";
-import { mkdtemp, mkdir, readFile, rename, rm, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { constants, createWriteStream } from "node:fs";
+import { lstat, mkdtemp, mkdir, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 
@@ -9,6 +9,7 @@ import type { Entry, ZipFile } from "yauzl";
 
 import { getAppStateSnapshot, installPetState, removePetState, setDefaultPet, type OpenPetsStateV1 } from "./app-state.js";
 import { getCatalogPet } from "./catalog.js";
+import { maxCodexPetJsonBytes, maxCodexSpritesheetBytes, validateCodexPetMetadata, type CodexPetMetadata } from "./codex-pets-core.js";
 import { builtInPet } from "./built-in-pet.js";
 import { assertInsideRoot, assertSafePetId, getInstalledPetDir, getPetsRoot } from "./pet-paths.js";
 import { assertOutputPathInside, hasSupportedZipMagic, ZipEntryPathTracker } from "./zip-safety.js";
@@ -40,7 +41,10 @@ export async function installPet(petId: string): Promise<OpenPetsStateV1> {
     try {
       assertInsideRoot(petsRoot, tempDir);
       await extractPetZip(zip, tempDir);
-      await validateExtractedPet(tempDir);
+      const metadata = await validateExtractedPet(tempDir);
+      if (metadata.id !== petId || metadata.id !== catalogPet.id) {
+        throw new Error("Catalog pet package id does not match the requested pet.");
+      }
       await rm(finalDir, { recursive: true, force: true });
       await rename(tempDir, finalDir);
 
@@ -59,6 +63,55 @@ export async function installPet(petId: string): Promise<OpenPetsStateV1> {
         await rm(finalDir, { recursive: true, force: true });
         throw error;
       }
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
+  });
+}
+
+export async function installPetFromZipFile(zipPath: string): Promise<OpenPetsStateV1> {
+  return withPetOperation("local-import", async () => {
+    const zip = await readRegularFile(zipPath, maxZipDownloadBytes, "pet zip");
+    validateZipMagic(zip);
+    const petsRoot = getPetsRoot();
+    await mkdir(petsRoot, { recursive: true, mode: 0o700 });
+    const tempDir = await mkdtemp(join(petsRoot, ".local-import-"));
+    try {
+      assertInsideRoot(petsRoot, tempDir);
+      await extractPetZip(zip, tempDir);
+      const metadata = await validateExtractedPet(tempDir);
+      await finalizeLocalPetInstall(metadata, tempDir);
+      return installLocalPetState(metadata);
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
+  });
+}
+
+export async function installPetFromFolder(folderPath: string): Promise<OpenPetsStateV1> {
+  return withPetOperation("local-import", async () => {
+    const sourceDir = resolve(folderPath);
+    const sourceStats = await lstat(sourceDir);
+    if (sourceStats.isSymbolicLink()) throw new Error("Pet folder cannot be a symlink.");
+    if (!sourceStats.isDirectory()) throw new Error("Pet folder must be a directory.");
+    if (await realpath(sourceDir) !== sourceDir) throw new Error("Pet folder path is not canonical.");
+    const parsed = JSON.parse((await readRegularFile(join(sourceDir, "pet.json"), maxCodexPetJsonBytes, "pet.json")).toString("utf8")) as unknown;
+    const parsedId = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : basename(sourceDir);
+    const metadata = validateCodexPetMetadata(parsed, parsedId);
+    assertSafePetId(metadata.id);
+    if (getAppStateSnapshot().pets.installed.some((pet) => pet.id === metadata.id)) throw new Error(`Pet is already installed: ${metadata.id}`);
+    const spritesheet = await readRegularFile(join(sourceDir, metadata.spritesheetPath), maxCodexSpritesheetBytes, "spritesheet.webp");
+    const petsRoot = getPetsRoot();
+    await mkdir(petsRoot, { recursive: true, mode: 0o700 });
+    const tempDir = await mkdtemp(join(petsRoot, `.local-import-${metadata.id}-`));
+    try {
+      assertInsideRoot(petsRoot, tempDir);
+      await writeFile(join(tempDir, "spritesheet.webp"), spritesheet, { mode: 0o600, flag: "wx" });
+      await writeFile(join(tempDir, "pet.json"), `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      await finalizeLocalPetInstall(metadata, tempDir);
+      return installLocalPetState(metadata);
     } catch (error) {
       await rm(tempDir, { recursive: true, force: true });
       throw error;
@@ -207,6 +260,7 @@ async function extractPetZip(zip: Buffer, tempDir: string): Promise<void> {
 
         fileCount += 1;
         if (fileCount > maxFiles) throw new Error("Zip contains too many files.");
+        if (safePath.relativeOutputPath === "pet.json" && entry.uncompressedSize > maxCodexPetJsonBytes) throw new Error("pet.json is too large.");
         if (entry.uncompressedSize > maxIndividualFileBytes) throw new Error("Zip entry is too large.");
         extractedTotal += entry.uncompressedSize;
         if (extractedTotal > maxExtractedTotalBytes) throw new Error("Zip extracted total is too large.");
@@ -214,7 +268,7 @@ async function extractPetZip(zip: Buffer, tempDir: string): Promise<void> {
         const outputPath = resolve(tempDir, safePath.relativeOutputPath);
         assertOutputPathInside(tempDir, outputPath);
         seenRequired.add(safePath.relativeOutputPath);
-        await writeEntry(entry, zipFile, outputPath, entry.uncompressedSize);
+        await writeEntry(entry, zipFile, outputPath, entry.uncompressedSize, safePath.relativeOutputPath === "pet.json" ? maxCodexPetJsonBytes : maxIndividualFileBytes);
       };
 
       zipFile.readEntry();
@@ -274,7 +328,7 @@ function getUnixMode(entry: Entry): number | null {
   return (entry.externalFileAttributes >> 16) & 0o177777;
 }
 
-function writeEntry(entry: Entry, zipFile: ZipFile, outputPath: string, expectedBytes: number): Promise<void> {
+function writeEntry(entry: Entry, zipFile: ZipFile, outputPath: string, expectedBytes: number, maxBytes: number): Promise<void> {
   return new Promise((resolvePromise, rejectPromise) => {
     zipFile.openReadStream(entry, (error, readStream) => {
       if (error) {
@@ -291,7 +345,7 @@ function writeEntry(entry: Entry, zipFile: ZipFile, outputPath: string, expected
       const counter = new Transform({
         transform(chunk: Buffer, _encoding, callback) {
           actualBytes += chunk.byteLength;
-          if (actualBytes > maxIndividualFileBytes) {
+          if (actualBytes > maxBytes) {
             callback(new Error("Zip entry exceeded individual size limit."));
             return;
           }
@@ -313,16 +367,74 @@ function writeEntry(entry: Entry, zipFile: ZipFile, outputPath: string, expected
   });
 }
 
-async function validateExtractedPet(tempDir: string): Promise<void> {
+async function validateExtractedPet(tempDir: string): Promise<CodexPetMetadata> {
   const petJsonPath = join(tempDir, "pet.json");
   const spritesheetPath = join(tempDir, "spritesheet.webp");
   assertOutputPathInside(tempDir, petJsonPath);
   assertOutputPathInside(tempDir, spritesheetPath);
 
-  JSON.parse(await readFile(petJsonPath, "utf8")) as unknown;
+  const parsed = JSON.parse((await readRegularFile(petJsonPath, maxCodexPetJsonBytes, "pet.json")).toString("utf8")) as unknown;
+  const parsedId = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : basename(tempDir);
+  const metadata = validateCodexPetMetadata(parsed, parsedId);
+  assertSafePetId(metadata.id);
 
   const spritesheet = await stat(spritesheetPath);
   if (!spritesheet.isFile()) throw new Error("spritesheet.webp must be a file.");
   if (spritesheet.size <= 0) throw new Error("spritesheet.webp is empty.");
   if (spritesheet.size > maxIndividualFileBytes) throw new Error("spritesheet.webp is too large.");
+  return metadata;
+}
+
+async function finalizeLocalPetInstall(metadata: CodexPetMetadata, tempDir: string): Promise<void> {
+  if (getAppStateSnapshot().pets.installed.some((pet) => pet.id === metadata.id)) throw new Error(`Pet is already installed: ${metadata.id}`);
+  const petsRoot = getPetsRoot();
+  const finalDir = getInstalledPetDir(metadata.id);
+  assertInsideRoot(petsRoot, finalDir);
+  await rm(finalDir, { recursive: true, force: true });
+  await rename(tempDir, finalDir);
+  try {
+    await validateInstalledRegularFile(join(finalDir, "spritesheet.webp"));
+    await validateInstalledRegularFile(join(finalDir, "pet.json"));
+  } catch (error) {
+    await rm(finalDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function readRegularFile(path: string, maxBytes: number, label: string): Promise<Buffer> {
+  const resolved = resolve(path);
+  const stats = await lstat(resolved);
+  if (stats.isSymbolicLink()) throw new Error(`${label} cannot be a symlink.`);
+  if (!stats.isFile()) throw new Error(`${label} must be a file.`);
+  if (stats.size <= 0 || stats.size > maxBytes) throw new Error(`${label} size is invalid.`);
+  const file = await open(resolved, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const openedStats = await file.stat();
+    if (!openedStats.isFile() || openedStats.size !== stats.size || openedStats.size <= 0 || openedStats.size > maxBytes) throw new Error(`${label} size is invalid.`);
+    return await file.readFile();
+  } finally {
+    await file.close();
+  }
+}
+
+async function validateInstalledRegularFile(path: string): Promise<void> {
+  const resolved = resolve(path);
+  const root = getPetsRoot();
+  if (resolved !== root && !resolved.startsWith(`${root}${sep}`)) throw new Error("Installed pet file escapes pets root.");
+  const stats = await lstat(resolved);
+  if (stats.isSymbolicLink()) throw new Error("Imported pet file cannot be a symlink.");
+  if (!stats.isFile()) throw new Error("Imported pet file must be a regular file.");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function installLocalPetState(metadata: CodexPetMetadata): Promise<OpenPetsStateV1> {
+  try {
+    return installPetState({ id: metadata.id, displayName: metadata.displayName, description: metadata.description });
+  } catch (error) {
+    await rm(getInstalledPetDir(metadata.id), { recursive: true, force: true });
+    throw error;
+  }
 }

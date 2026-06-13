@@ -4,11 +4,14 @@ import { relative, resolve, sep } from "node:path";
 import { validateReaction, validateSayMessage, type OpenPetsReaction } from "./local-ipc-protocol.js";
 import { resolvePluginNumericConfig, resolvePluginStringConfig } from "./plugin-config.js";
 import type { PluginJsHost, PluginJsHostInstance } from "./plugin-js-host.js";
+import { loadPluginLocales, registerPluginLocales, unregisterPluginLocales } from "./plugin-i18n.js";
 import { defaultMaxPluginManifestBytes, readSafePluginManifest } from "./plugin-manifest-reader.js";
 import { type OpenPetsJavascriptPluginManifest, type OpenPetsPluginManifest, type PluginAction } from "./plugin-manifest.js";
 import type { PluginPetApi } from "./plugin-pet-api.js";
-import { PluginSdkBridge, type PluginLogLevel, type PluginRuntimePublicState, type PluginStorageStore } from "./plugin-sdk-bridge.js";
+import { PluginSdkBridge, type PluginHostCapabilities, type PluginLogLevel, type PluginRuntimePublicState, type PluginStorageStore } from "./plugin-sdk-bridge.js";
+import type { PluginInspectorState } from "./plugin-sdk-state.js";
 import type { PluginStateRecord, PluginStateStore } from "./plugin-state.js";
+import { classifyPluginError, logPluginDiagnostic } from "./plugin-diagnostics.js";
 
 export interface PluginTimerHandle { cancel(): void }
 export interface PluginRuntimeScheduler { setTimeout(callback: () => void, delayMs: number): PluginTimerHandle }
@@ -30,6 +33,7 @@ export type PluginRuntimeOptions = {
   readonly jsHost?: PluginJsHost;
   readonly storageStore?: PluginStorageStore;
   readonly logger?: (level: PluginLogLevel, message: string, fields?: Record<string, unknown>) => void;
+  readonly capabilities?: PluginHostCapabilities;
 };
 
 type CompiledTimer = { readonly intervalMs: number; readonly actions: readonly CompiledAction[] };
@@ -43,6 +47,7 @@ export class PluginRuntime {
   readonly #allowedPluginRoots: readonly string[];
   readonly #maxManifestBytes: number;
   readonly #jsHost?: PluginJsHost;
+  readonly #capabilities?: PluginHostCapabilities;
   readonly #sdkBridge: PluginSdkBridge;
   readonly #logger: (level: PluginLogLevel, message: string, fields?: Record<string, unknown>) => void;
   readonly #slots = new Map<string, PluginRuntimeSlot>();
@@ -55,40 +60,50 @@ export class PluginRuntime {
     this.#allowedPluginRoots = options.allowedPluginRoots;
     this.#maxManifestBytes = options.maxManifestBytes ?? defaultMaxPluginManifestBytes;
     this.#jsHost = options.jsHost;
+    this.#capabilities = options.capabilities;
     this.#logger = options.logger ?? (() => undefined);
-    this.#sdkBridge = new PluginSdkBridge({ stateStore: this.#stateStore, petApi: this.#petApi, scheduler: this.#scheduler, storage: options.storageStore, onError: (id, reason) => this.#markBroken(id, reason), logger: this.#logger });
+    this.#sdkBridge = new PluginSdkBridge({ stateStore: this.#stateStore, petApi: this.#petApi, scheduler: this.#scheduler, storage: options.storageStore, onError: (id, reason) => this.#markBroken(id, reason), logger: this.#logger, capabilities: options.capabilities });
   }
 
   async start(): Promise<void> {
+    logPluginDiagnostic(this.#logger, "debug", "plugin runtime start", { phase: "begin" });
     this.#active = true;
     await this.reloadAll();
+    logPluginDiagnostic(this.#logger, "debug", "plugin runtime start", { phase: "success" });
   }
 
   stop(): void {
+    logPluginDiagnostic(this.#logger, "debug", "plugin runtime stop", { phase: "begin" });
     this.#active = false;
     for (const id of this.#slots.keys()) this.#cancelPlugin(id);
+    logPluginDiagnostic(this.#logger, "debug", "plugin runtime stop", { phase: "end" });
   }
 
   getPluginState(id: string): PluginRuntimePublicState { return this.#sdkBridge.getPublicState(id); }
-  executeCommand(id: string, commandId: string): Promise<void> { return this.#sdkBridge.executeCommand(id, commandId); }
+  getInspectorState(id: string): PluginInspectorState { return this.#sdkBridge.getInspectorState(id); }
+  executeCommand(id: string, commandId: string, args?: Record<string, unknown>): Promise<void> { return this.#sdkBridge.executeCommand(id, commandId, args); }
+  executeMenuSelect(id: string, itemId: string): Promise<void> { return this.#sdkBridge.executeMenuSelect(id, itemId); }
   notifyConfigChanged(id: string): void { this.#sdkBridge.notifyConfigChanged(id); }
+  resyncSchedules(): void { this.#sdkBridge.resyncSchedules(); }
 
   async reloadAll(): Promise<void> {
     for (const id of this.#slots.keys()) this.#cancelPlugin(id);
     const records = this.#stateStore.listRecords();
     const jsIds: string[] = [];
     for (const record of records) {
-      if (record.runtime === "javascript" || record.manifestVersion === 2) jsIds.push(record.id);
+      if (record.runtime === "javascript" || record.manifestVersion === 2 || record.manifestVersion === 3) jsIds.push(record.id);
       else await this.reloadPlugin(record.id);
     }
     await Promise.all(jsIds.map((id) => this.reloadPlugin(id)));
   }
 
   async reloadPlugin(id: string): Promise<void> {
+    const started = Date.now();
+    logPluginDiagnostic(this.#logger, "debug", "plugin reload", { pluginId: id, phase: "begin" });
     this.#cancelPlugin(id);
-    if (!this.#active) return;
+    if (!this.#active) { logPluginDiagnostic(this.#logger, "debug", "plugin reload", { pluginId: id, phase: "skip", reason: "runtime-inactive" }); return; }
     const record = this.#stateStore.getRecord(id);
-    if (!record || !record.enabled || record.catalogDisabled) return;
+    if (!record || !record.enabled || record.catalogDisabled) { logPluginDiagnostic(this.#logger, "debug", "plugin reload", { pluginId: id, phase: "skip", reason: !record ? "not-installed" : !record.enabled ? "disabled" : "catalog-disabled" }); return; }
     const slot = this.#slotFor(id);
     const generation = slot.generation;
 
@@ -97,14 +112,18 @@ export class PluginRuntime {
       if (!this.#canCommitReload(record, generation)) return;
       this.#stateStore.clearBrokenReason(id);
       if (manifest.runtime === "javascript") {
+        logPluginDiagnostic(this.#logger, "debug", "plugin start", { pluginId: id, runtime: "javascript", phase: "begin" });
         await this.#startJavascriptPlugin(record, manifest, slot, generation);
       } else {
+        logPluginDiagnostic(this.#logger, "debug", "plugin start", { pluginId: id, runtime: "declarative", phase: "begin" });
         const timers = this.#compileDeclarativePlugin(record, manifest);
         if (!this.#canCommitReload(record, generation)) return;
         slot.active = true;
         for (const timer of timers) this.#scheduleTimer(id, slot, generation, timer);
+        logPluginDiagnostic(this.#logger, "info", "plugin reload", { pluginId: id, runtime: "declarative", phase: "success", durationMs: Date.now() - started, count: timers.length });
       }
     } catch (error) {
+      logPluginDiagnostic(this.#logger, "warn", "plugin reload", { pluginId: id, phase: "fail", reason: error instanceof Error ? error.message : String(error), errorCode: classifyPluginError(error), durationMs: Date.now() - started });
       if (this.#canCommitReload(record, generation)) this.#markBroken(id, error instanceof Error ? error.message : "Plugin runtime validation failed.");
     }
   }
@@ -134,6 +153,8 @@ export class PluginRuntime {
     const approved = new Set(record.approvedPermissions);
     for (const permission of manifest.permissions) if (!approved.has(permission)) throw new Error(`Plugin permission is not approved: ${permission}`);
     const entryPath = await resolveJavascriptEntry(record.installPath, manifest.entry);
+    const catalogs = await loadPluginLocales(record.installPath);
+    registerPluginLocales(record.id, catalogs);
     const sdk = this.#sdkBridge.createApi(record, manifest);
     const host = await this.#jsHost.startPlugin({ record, manifest, entryPath, sdk, onBroken: (reason) => {
       if (this.#canCommitReload(record, generation)) this.#markBroken(record.id, reason);
@@ -144,7 +165,7 @@ export class PluginRuntime {
     }
     slot.jsHost = host;
     slot.active = true;
-    this.#logger("info", "plugin started", { id: record.id, version: record.version, source: record.source, runtime: manifest.runtime });
+    logPluginDiagnostic(this.#logger, "info", "plugin started", { pluginId: record.id, runtime: manifest.runtime, source: record.source, phase: "success" });
   }
 
   #scheduleTimer(id: string, slot: PluginRuntimeSlot, generation: number, timer: CompiledTimer): void {
@@ -155,10 +176,12 @@ export class PluginRuntime {
       void this.#runTimer(id, slot, generation, timer);
     }, timer.intervalMs);
     slot.timers.push(handle);
+    logPluginDiagnostic(this.#logger, "debug", "plugin declarative schedule created", { pluginId: id, runtime: "declarative", scheduleId: String(generation), durationMs: timer.intervalMs });
   }
 
   async #runTimer(id: string, slot: PluginRuntimeSlot, generation: number, timer: CompiledTimer): Promise<void> {
     try {
+      logPluginDiagnostic(this.#logger, "debug", "plugin declarative schedule fired", { pluginId: id, runtime: "declarative", scheduleId: String(generation) });
       for (const action of timer.actions) {
         if (!this.#active || !slot.active || slot.generation !== generation) return;
         if (action.type === "pet.speak") await this.#petApi.speak(action.message);
@@ -166,25 +189,31 @@ export class PluginRuntime {
       }
       if (this.#active && slot.active && slot.generation === generation) this.#scheduleTimer(id, slot, generation, timer);
     } catch (error) {
+      logPluginDiagnostic(this.#logger, "warn", "plugin declarative callback failed", { pluginId: id, runtime: "declarative", scheduleId: String(generation), reason: error instanceof Error ? error.message : String(error), errorCode: classifyPluginError(error) });
       if (this.#active && slot.active && slot.generation === generation) this.#markBroken(id, error instanceof Error ? error.message : "Plugin action failed.");
     }
   }
 
   #markBroken(id: string, reason: string): void {
-    this.#logger("error", "plugin marked broken", { id, reason });
+    logPluginDiagnostic(this.#logger, "error", "plugin marked broken", { pluginId: id, reason });
     this.#cancelPlugin(id);
     this.#stateStore.setBrokenReason(id, reason);
   }
 
   #cancelPlugin(id: string): void {
     const slot = this.#slotFor(id);
+    if (slot.active || slot.timers.length > 0 || slot.jsHost) logPluginDiagnostic(this.#logger, "debug", "plugin cancel", { pluginId: id, phase: "begin", count: slot.timers.length });
     slot.active = false;
     slot.generation += 1;
     for (const timer of slot.timers) timer.cancel();
     slot.timers = [];
     slot.jsHost?.stop();
     slot.jsHost = undefined;
+    unregisterPluginLocales(id);
     this.#sdkBridge.clearPlugin(id);
+    const teardown = (this.#capabilities as { clearPlugin?: (pluginId: string) => void } | undefined)?.clearPlugin;
+    if (teardown) { try { teardown(id); } catch { /* host teardown is best effort */ } }
+    logPluginDiagnostic(this.#logger, "debug", "plugin cancel", { pluginId: id, phase: "end" });
   }
 
   #slotFor(id: string): PluginRuntimeSlot {

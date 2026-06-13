@@ -30,17 +30,40 @@ async function main(): Promise<void> {
   const leaseReady = acquireStartupLease(context.client, lease, options.petId);
   const server = createOpenPetsMcpServer({ ...context, lease, leaseReady });
   let heartbeatTimer: NodeJS.Timeout | null = null;
+  let retryTimer: NodeJS.Timeout | null = null;
+  let retryDelayMs = 5_000;
+  const MAX_RETRY_DELAY_MS = 60_000;
   let closing = false;
+
+  function scheduleRetry(): void {
+    if (retryTimer || closing) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (closing || lease.lease) return;
+      void context.client.acquireLease({ requestedPetId: options.petId }).then((result) => {
+        lease.lease = result;
+        lease.staleLeaseId = undefined;
+        lease.degradedReason = undefined;
+        retryDelayMs = 5_000;
+      }).catch((error: unknown) => {
+        lease.degradedReason = sanitizeMcpRuntimeError(error);
+        retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_DELAY_MS);
+        scheduleRetry();
+      });
+    }, retryDelayMs);
+    retryTimer.unref?.();
+  }
+
   leaseReady.then(() => {
     if (!lease.lease) return;
     heartbeatTimer = setInterval(() => {
-      if (!lease.lease) return;
+      if (closing || !lease.lease) return;
       void context.client.heartbeatLease(lease.lease.leaseId).catch((error: unknown) => {
         lease.staleLeaseId = lease.lease?.leaseId;
         lease.degradedReason = sanitizeMcpRuntimeError(error);
         lease.lease = undefined;
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
+        retryDelayMs = 5_000;
+        scheduleRetry();
       });
     }, 5_000);
     heartbeatTimer.unref?.();
@@ -51,6 +74,8 @@ async function main(): Promise<void> {
     closing = true;
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
     const leaseId = lease.lease?.leaseId;
     lease.lease = undefined;
     if (leaseId) {

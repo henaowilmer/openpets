@@ -1,97 +1,77 @@
-# packages/cli/
-
-Main CLI tool for OpenPets agent configuration and pet management.
+# Package: @open-pets/cli
 
 ## Responsibility
 
-Primary user-facing CLI for the OpenPets ecosystem. Provides commands for: installing pets from gallery, configuring projects for Claude/OpenCode/Cursor agents, running MCP server wrapper, executing Claude hooks, and direct pet interaction (status, react, say).
+Main developer CLI tool for OpenPets agent configuration and plugin/pet asset management. Provides commands to configure local projects for integrations (Claude, OpenCode, Cursor), manage/install pets, execute Claude hooks, spawn the local MCP server wrapper, and validate or scaffold custom plugins.
 
 ## Design/Patterns
 
-**Command Router**: `main()` dispatches to subcommands based on `process.argv[2]`:
-- `install <pet-id>` - Install pet via running app
-- `configure` - Interactive project setup for Claude, OpenCode, or Cursor
-- `status` - Check OpenPets desktop app connectivity and print JSON status
-- `pets` - List installed pets with flags (default, broken)
-- `react <reaction>` - Send reaction to desktop app
-- `say <message> [--reaction <reaction>]` - Display message on pet
-- `mcp` - Spawn MCP server (delegates to `@open-pets/mcp`)
-- `hook` - Execute Claude hook from stdin
+**Command Route Processor** (`src/index.ts`):
+- Handles command dispatching from CLI inputs:
+  - `install <pet-id>`: Downloads/installs a pet via client.
+  - `configure`: Configures code editors (Claude, OpenCode, Cursor).
+  - `status`: Connects to app IPC and prints JSON status.
+  - `pets`: Lists installed pets.
+  - `react <reaction>`: Sends reaction message to active pet.
+  - `say <message>`: Displays speech on active pet.
+  - `mcp`: Launches standard Model Context Protocol (MCP) server daemon.
+  - `hook`: Runs Claude Code lifecycle hooks.
+  - `plugin validate <dir>`: Validates a local plugin's manifest, permissions, config, assets, panels, and referenced files before install/release.
+  - `plugin new <name> --template <name>`: Scaffolds a new SDK v3 plugin package using predefined templates.
 
-**Configuration Flow** (`configureProject`):
-1. Resolve project directory (symlink/escape checks)
-2. Route to agent-specific handler (claude/opencode/cursor)
-3. For Claude: Assert availability, list pets, build MCP config, write hooks
-4. For OpenCode: Prepare and write OpenCode config via `@open-pets/opencode`
-5. For Cursor: Configure MCP in `.cursor/mcp.json`, optional rules in `.cursor/rules/openpets.mdc`
+**Project Scaffolding** (`src/plugin-templates.ts`):
+- Ships standard SDK v3 plugin starter templates (`blank`, `reminder`, `ambient`, `ai-chat`, `tamagotchi`, `calendar`) containing manifestVersion 3 definitions, code entries, test harness files, README content, and optional `locales/en.json` dictionaries.
+- Templates exercise current SuperPlugins surfaces such as `ctx.ui.alert`, dynamic speech, events, schedules, storage, commands, AI, assets, and Tamagotchi-style state loops.
 
-**Cursor Configuration**:
-- `--with-rules` - Install MCP + project rules
-- `--rules-only` - Install only `.cursor/rules/openpets.mdc`
-- `--remove-rules` - Remove managed rules file
-- Status classification: `not_installed`, `installed`, `needs_update`, `conflict`, `error`
-- Atomic writes with backup creation
+**Plugin Validator** (`src/plugin-validate.ts`):
+- Checks plugin directories against manifest requirements, v2/v3 permission lists, SDK version compatibility, config field types (`date`, `secret`, `sound` for v3), network hosts, asset formats/size caps, entry files, and HTML panels.
 
-**Safety Checks**:
-- Project path validation (no symlinks, must be directory)
-- `.claude`/`.cursor`/`.opencode` directory safety (no symlinks, path containment)
-- Settings file atomic writes (temp + rename pattern)
-- Shell argument quoting for command injection prevention
+**Editor Configuration Actions**:
+- **Claude**: Appends OpenPets hooks command hooks to global/project setting files and configures Claude's MCP configuration.
+- **OpenCode**: Modifies local instruction entries and links client plugins via `@open-pets/opencode`.
+- **Cursor**: Generates MCP definitions in `.cursor/mcp.json` and updates MDC rule files (`.cursor/rules/openpets.mdc`).
 
-**Pet Resolution** (`resolveConfiguredPet`):
-- Validates explicit `--pet` argument
-- Otherwise: fetches installed pets, interactive TTY prompt
-- Validates selected pet is not broken
+**Safety Constraints**:
+- Enforces strict path checks preventing path traversals or symlink escapes on project folders.
+- Writes configurations atomically using a temporary-write-and-rename pattern, making backups before committing changes.
 
-## Flow
+## Data & Control Flow
 
+```text
+CLI command input (e.g. openpets configure --agent claude)
+    ↓
+resolveProjectDir() → Enforce safe paths
+    ↓
+Check editor tool presence (e.g., claude CLI or Cursor settings)
+    ↓
+Acquire active pet selection/lease via IPC
+    ↓
+Perform atomic update of config files & local hooks
 ```
-openpets configure --agent claude --pet <id> --cwd <dir>
-    ↓
-resolveProjectDir() → assertSafeProjectHookPath()
-    ↓
-assertClaudeAvailable() (spawnSync "claude --version")
-    ↓
-resolveConfiguredPet() → listPets() → pickPet() (interactive)
-    ↓
-prepareProjectLocalHooks() → Build hook command with marker
-    ↓
-runClaudeMcpAddJson() → spawnSync "claude mcp add-json ..."
-    ↓
-writePreparedHooks() → Atomic write to .claude/settings.local.json
 
-openpets configure --agent cursor --with-rules
+```text
+CLI command plugin validate <dir>
     ↓
-readCursorMcpConfig() → classifyCursorMcpStatus()
+Checks existence of openpets.plugin.json
     ↓
-readCursorOpenPetsRules() → classifyCursorRulesStatus()
+Validates manifest fields (id, version, sdkVersion, entry)
     ↓
-planCursorMcpInstall/Replace() → executeCursorMcpWrite()
-    ↓
-planCursorRulesInstall/Replace() → executeCursorRulesWrite()
+Validates permissions, hosts list, config schema, assets, and panels
+```
 
-openpets status
+```text
+CLI command plugin new <name> [--template template] [--dir output]
     ↓
-createOpenPetsClient().status() → Print JSON result
+Normalizes plugin id/name and selects template
+    ↓
+Writes manifest, index.js, test.js, README, and optional locales/en.json
+    ↓
+Generated code targets @open-pets/plugin-sdk/testing for local verification
 ```
 
 ## Integration Points
 
-**Dependencies**:
-- `@open-pets/client` - Pet listing, installation, status, react, say
-- `@open-pets/claude` - Hook management, MCP config
-- `@open-pets/mcp` - MCP server spawning
-- `@open-pets/opencode` - OpenCode project setup
-- `@open-pets/cursor` - Cursor project setup (MCP + rules)
-
-**External Commands**:
-- `claude` - Claude Code CLI for MCP configuration
-- `npx` - For published package execution
-
-**Exports**:
-- `cliPackageName` constant
-- `configureProject()`, `resolveConfiguredPet()` - Programmatic API
-- `parseConfigureArgs()`, `parseInstallArgs()`, `parseReactArgs()`, `parseSayArgs()` - Argument parsing
-- `createVersionPinnedCliCommand()`, `createLocalDevCliCommand()` - Command builders
-- `installProjectLocalHooks()`, `prepareProjectLocalHooks()` - Hook installation
-- `runClaudeMcpAddJson()`, `createClaudeMcpAddJsonArgs()` - MCP integration
+- **Dependencies**: Depends on `@open-pets/client` for IPC communications, `@open-pets/claude` for Claude hooks/MCP configuration, `@open-pets/mcp` for spawning the MCP transport server, `@open-pets/opencode` for OpenCode extensions, and `@open-pets/cursor` for Cursor Rules/MCP config settings.
+- **Plugin SDK**: Scaffolds plugin code that references `@open-pets/plugin-sdk` and tests with `@open-pets/plugin-sdk/testing`.
+- **External Dependencies**: Invokes editor command lines: `claude` (Claude Code settings integration) and `npx` (optional package runtime launcher).
+- **Detailed source map**: [src/codemap.md](src/codemap.md)

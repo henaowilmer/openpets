@@ -294,3 +294,5 @@ Throttle state stores only speech-category and reaction timestamp keys, never pr
 - Tool args and command text are used only for coarse reaction classification.
 - The plugin ignores OpenPets MCP tools to avoid feedback loops.
 - Managed setup refuses unsafe symlinks, non-regular files, oversized config files, and conflicting custom OpenPets-like config.
+
+This document is intentionally kept in the repository because the root README links here and because it documents Termux/OpenCode/MCP behavior that is still supported in the Termux fork.

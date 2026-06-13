@@ -6,7 +6,7 @@ MCP (Model Context Protocol) server for OpenPets integration.
 
 Implements an MCP server exposing OpenPets functionality to AI agents via the Model Context Protocol. Provides tools for checking status, setting reactions, and displaying messages on the desktop pet.
 
-## Design
+## Design/Patterns
 
 **MCP Server Setup** (`server.ts`):
 - `McpServer` from `@modelcontextprotocol/sdk`
@@ -18,7 +18,8 @@ Implements an MCP server exposing OpenPets functionality to AI agents via the Mo
 - Zod schemas for input validation (`saySchema`, `reactSchema`)
 - Lease-aware operations (acquires lease on startup, heartbeat every 5s)
 - Throttling integration for speech/reactions
-- Error sanitization (hides IPC paths, tokens)
+- Error sanitization (hides IPC paths, tokens, sockets, and local paths)
+- Structured MCP results: tools return `structuredContent` with status, routing, lease, and operation result metadata when available.
 
 **Lifecycle Management** (`index.ts`):
 - Startup lease acquisition (async, non-blocking)
@@ -34,7 +35,7 @@ Implements an MCP server exposing OpenPets functionality to AI agents via the Mo
 **Build Integration** (`ensure-executable.ts`):
 - Post-build chmod 0o755 for Unix binaries
 
-## Flow
+## Data & Control Flow
 
 ```
 main()
@@ -66,3 +67,4 @@ server.connect(StdioServerTransport)
 **Exports**:
 - Binary: `open-pets-mcp` (stdio MCP server)
 - No programmatic exports (MCP server is standalone)
+- Source map: [src/codemap.md](src/codemap.md)

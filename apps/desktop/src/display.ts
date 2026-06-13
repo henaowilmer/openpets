@@ -11,8 +11,8 @@ export interface WindowSize {
 }
 
 export const defaultPetWindowSize: WindowSize = {
-  width: 220,
-  height: 320,
+  width: 340,
+  height: 420,
 };
 
 export const defaultPetWindowMargin = 24;
@@ -26,8 +26,12 @@ export function getDefaultPetInitialPosition(size: WindowSize = defaultPetWindow
   };
 }
 
-export function clampToPrimaryWorkArea(position: Point, size: WindowSize = defaultPetWindowSize): Point {
-  const { workArea } = screen.getPrimaryDisplay();
+export function clampToVisibleWorkArea(position: Point, size: WindowSize = defaultPetWindowSize): Point {
+  // Clamp to the display the pet currently lives on (the one nearest its centre),
+  // not the primary display — otherwise a pet on an external monitor gets yanked
+  // back to the built-in screen whenever its position is read, saved, or restored.
+  const centre = { x: position.x + size.width / 2, y: position.y + size.height / 2 };
+  const { workArea } = screen.getDisplayNearestPoint(centre);
   const minX = workArea.x;
   const minY = workArea.y;
   const maxX = workArea.x + Math.max(0, workArea.width - size.width);

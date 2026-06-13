@@ -1,3 +1,5 @@
+import type { Locale } from "./i18n/catalog.js";
+import { localizedReactionMessagePools } from "./i18n/reactions/index.js";
 import type { OpenPetsReaction } from "./local-ipc-protocol.js";
 
 export const reactionMessagePools = {
@@ -157,7 +159,7 @@ export const reactionMessagePools = {
   ],
 } as const satisfies Record<OpenPetsReaction, readonly string[]>;
 
-export function pickReactionMessage(reaction: OpenPetsReaction, random: () => number = Math.random): string {
-  const pool = reactionMessagePools[reaction];
+export function pickReactionMessage(reaction: OpenPetsReaction, random: () => number = Math.random, locale: Locale = "en"): string {
+  const pool = localizedReactionMessagePools[locale]?.[reaction] ?? reactionMessagePools[reaction];
   return pool[Math.floor(random() * pool.length) % pool.length] ?? reaction;
 }

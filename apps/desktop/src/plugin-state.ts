@@ -19,7 +19,8 @@ export type PluginStateRecord = {
   readonly manifestPath: string;
   readonly installPath: string;
   readonly source: PluginSource;
-  readonly manifestVersion?: 1 | 2;
+  readonly bundled?: boolean;
+  readonly manifestVersion?: 1 | 2 | 3;
   readonly runtime?: KnownPluginRuntime;
   readonly sdkVersion?: string;
   readonly enabled: boolean;
@@ -192,7 +193,8 @@ function normalizePluginRecordFromDisk(key: string, value: unknown): PluginState
       manifestPath: value.manifestPath,
       installPath: value.installPath,
       source: value.source,
-      manifestVersion: value.manifestVersion === 1 || value.manifestVersion === 2 ? value.manifestVersion : undefined,
+      bundled: value.bundled === true ? true : undefined,
+      manifestVersion: value.manifestVersion === 1 || value.manifestVersion === 2 || value.manifestVersion === 3 ? value.manifestVersion : undefined,
       runtime: value.runtime === "declarative" || value.runtime === "javascript" ? value.runtime : undefined,
       sdkVersion: isNonEmptyString(value.sdkVersion) ? value.sdkVersion : undefined,
       enabled: value.enabled,
@@ -221,7 +223,8 @@ function normalizePluginRecordForApi(record: PluginStateRecord): PluginStateReco
     manifestPath: record.manifestPath,
     installPath: record.installPath,
     source: record.source,
-    manifestVersion: record.manifestVersion === 1 || record.manifestVersion === 2 ? record.manifestVersion : undefined,
+    bundled: record.bundled === true ? true : undefined,
+    manifestVersion: record.manifestVersion === 1 || record.manifestVersion === 2 || record.manifestVersion === 3 ? record.manifestVersion : undefined,
     runtime: record.runtime === "declarative" || record.runtime === "javascript" ? record.runtime : undefined,
     sdkVersion: isNonEmptyString(record.sdkVersion) ? record.sdkVersion : undefined,
     enabled: record.enabled,

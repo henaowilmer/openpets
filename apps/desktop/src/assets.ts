@@ -3,6 +3,24 @@ import { join } from "node:path";
 import { app, nativeImage, type NativeImage } from "electron";
 
 const trayIconRelativePath = join("assets", "tray-icon.png");
+const appIconRelativePath = join("assets", "app-icon.png");
+let cachedAppIcon: NativeImage | null = null;
+
+export function createAppIcon(): NativeImage {
+  if (cachedAppIcon && !cachedAppIcon.isEmpty()) return cachedAppIcon;
+
+  const assetPath = join(app.getAppPath(), appIconRelativePath);
+  const assetImage = nativeImage.createFromPath(assetPath);
+
+  if (!assetImage.isEmpty()) {
+    cachedAppIcon = assetImage;
+    return cachedAppIcon;
+  }
+
+  console.error(`OpenPets app icon asset could not be loaded from ${assetPath}; using generated fallback icon.`);
+  cachedAppIcon = createFallbackTrayIcon();
+  return cachedAppIcon;
+}
 
 export function createTrayIcon(): NativeImage {
   const assetPath = join(app.getAppPath(), trayIconRelativePath);

@@ -2,21 +2,25 @@
 
 ## Responsibility
 
-Core TypeScript source for the OpenPets desktop application. Organized into: lifecycle management, state persistence, UI windows, pet rendering, IPC server, agent integrations, pet installation/management, and the manifest-only plugin subsystem.
+Core TypeScript source for the OpenPets desktop application. Organized into: lifecycle management, state persistence, Control Center and pet windows, IPC server, agent integrations, pet installation/management, and declarative plus JavaScript plugin runtimes.
 
-## Design
+## Design/Patterns
 
 - **Modular Controllers**: Separate controllers for default pet vs agent pets (lease-based)
 - **Protocol-First IPC**: Versioned JSON protocol over TCP/Unix sockets with token auth
 - **Defensive I/O**: All file operations use temp+rename for atomicity, path traversal validation, symlink checks
 - **Validation at Boundaries**: Catalog, ZIP entries, pet metadata, and IPC params all strictly validated
 - **Lease Pattern**: Agent pets use expiring leases (15s TTL) with heartbeats; default pet is persistent
-- **Sandboxed HTML**: All UI is data-URL or file-URL HTML with inline CSS, no external resources
+- **Sandboxed Renderers**: Control Center loads the Vite React/Tailwind bundle through a hardened BrowserWindow and narrow preload bridge; transparent pet windows and plugin SDK host windows stay separate
 - **Structured Logging**: Scoped logging (app, ipc, lease, pet.*, state, tray, ui) with log rotation and redaction
 - **Reaction Animation Mapping**: User-configurable mapping from reaction types to sprite animation states
-- **Manifest-Only Plugins**: Plugins are declarative `openpets.plugin.json` manifests with approved permissions, persisted config, safe path checks, and timer-triggered pet actions; JavaScript runtime is recognized but unsupported.
+- **Plugin Runtimes**: Plugins use validated manifests, approved permissions, persisted config, safe path checks, declarative timer-triggered actions, or sandboxed JavaScript entry modules through the SDK bridge.
+- **Capability-Oriented SDK Surface**: The plugin bridge is split into focused SDK modules for audio, bus, config, events, quotas, routes, state, storage, types, and UI so permission checks and host effects stay localized.
+- **Host-Rendered Plugin UI**: Plugins describe bubbles, alerts, commands, panels, assets, and pet behavior; the host validates descriptors and renders them through pet windows, Control Center IPC, or sandboxed panel windows.
+- **Localized Runtime Content**: `i18n/` and plugin locale catalogs resolve host UI text, pet reaction messages, and plugin `$t:` strings through fallback-aware message catalogs.
+- **Motion Engine Abstraction**: Advanced pet movement uses a small physics/interpolation engine rather than embedding movement math in window or SDK routing code.
 
-## Flow
+## Data & Control Flow
 
 **Main Process Flow**:
 ```
@@ -24,7 +28,7 @@ main.ts
 ├── lifecycle.ts (app events, cleanup)
 ├── logger.ts (structured logging init)
 ├── app-state.ts (state init)
-├── plugin-service.ts (plugin state/runtime init)
+├── plugin-service.ts (plugin state/runtime init, JS host wiring)
 ├── tray.ts (tray creation)
 ├── local-ipc.ts (IPC server start)
 └── windows.ts (UI handlers)
@@ -50,8 +54,13 @@ pet-window.ts
 │   ├── HTML generation with CSS sprite animation
 │   ├── reaction-animation-mapping.ts (resolveReactionSpriteState)
 │   ├── reaction-messages.ts (pickReactionMessage for bubbles)
-│   └── Speech bubbles with status badges
+│   ├── i18n/reactions (localized reaction speech pools)
+│   └── Speech bubbles, alert indicators, pinned HUDs, and status reactions
 └── pet-preload.cjs (renderer IPC for drag/click-through)
+
+Plugin motion APIs:
+plugin-sdk-bridge.ts → plugin-sdk-routes.ts → plugin-pet-registry.ts
+└── pet-motion-engine.ts tick() calculates interpolated target vectors for spawned/default pets
 ```
 
 **Agent Setup Flow**:
@@ -78,17 +87,38 @@ pet-installation.ts
 └── importCodexPet() → codex-pets.ts
 ```
 
+**Control Center Flow**:
+```
+tray.ts → openControlCenterWindow(route) → windows.ts
+├── hardened BrowserWindow loads Vite renderer or packaged dist/renderer/index.html
+├── control-center-preload.cjs exposes page-specific APIs
+├── Dashboard snapshot: default pet, catalog, plugin health, update status, activity
+└── renderer/src/main.tsx routes Dashboard/Pets/Integrations/Plugins/Settings
+```
+
 **Plugin Flow**:
 ```
-main.ts → initializePluginService(userData, defaultPluginPetApi).start()
+main.ts → initializePluginService(userData, defaultPluginPetApi, appVersion, ElectronPluginJsHost).start()
 ├── plugin-state.ts reads/writes userData/openpets-plugin-state.json
-├── plugin-runtime.ts reloads enabled manifests and schedules timer triggers
-│   └── plugin-pet-api.ts → default-pet-controller external say/react APIs
+├── plugin-platform-settings.ts gates audio, voice, speech, mic, quiet hours, and AI provider choices
+├── plugin-assets.ts validates/resolves declared plugin assets for SDK refs and rendered UI
+├── plugin-user-sound-store.ts stores imported user sounds as plugin-scoped opaque refs
+├── plugin-diagnostics.ts records plugin errors/quota/settings blocks for inspector/health UI
+├── plugin-runtime.ts reloads enabled manifests
+│   ├── declarative runtime schedules timer triggers
+│   ├── plugin-js-host.ts starts hidden sandboxed BrowserWindow hosts for JavaScript plugins
+│   └── plugin-sdk-bridge.ts dispatches namespaced SDK routes
+│       ├── plugin-sdk-audio.ts/plugin-voice.ts → renderer/OS playback and speech surfaces
+│       ├── plugin-sdk-bus.ts/plugin-sdk-events.ts → curated pub/sub and host event streams
+│       ├── plugin-sdk-config.ts/plugin-sdk-storage.ts/plugin-sdk-state.ts → config, persistent plugin data, and subscriptions
+│       ├── plugin-sdk-ui.ts/plugin-panels.ts/plugin-toast.ts → bubbles, alerts, commands, panels, and toasts
+│       ├── plugin-oauth.ts/plugin-secrets.ts/plugin-ai-gateway.ts → host-mediated auth, encrypted secrets, and AI gateway
+│       └── plugin-pet-api.ts/plugin-pet-registry.ts/default-pet-controller → default/spawned pet actions
 ├── plugin-service.ts orchestrates UI actions, permission confirmation, config validation, install/update/uninstall/load-local, and runtime reloads
 └── lifecycle.ts → stopPluginService() on quit
 
-Plugins window:
-tray.ts → openTaskWindow("plugins") → windows.ts → plugins-window.ts
+Control Center plugins route:
+tray.ts → openControlCenterWindow("plugins") → windows.ts → renderer React app
 └── openpets:plugins-* IPC handlers call PluginService methods
 
 Catalog install/update:
@@ -99,32 +129,44 @@ Local development load:
 plugin-local-loader.ts validates selected folder manifest and snapshots only openpets.plugin.json to userData/plugins-dev/{id}
 ```
 
+**Localization Flow**:
+```
+main.ts/settings → i18n.setLocaleFromPreference(system/user locale)
+├── i18n/catalog.ts resolves host message dictionaries with English fallback
+├── reaction-messages.ts reads localized reaction pools for pet speech
+├── windows.ts exposes active messages to the Control Center renderer
+└── plugin-i18n.ts resolves plugin locales, manifest $t: fields, and ctx.t(...) runtime strings
+```
+
 ## Integration Points
 
 - **Within src/**:
-  - `main.ts` → all modules (orchestrator)
+  - `main.ts` → all modules (orchestrator), including `ElectronPluginJsHost` for JavaScript plugins
   - `local-ipc.ts` ↔ `lease-manager.ts` ↔ `agent-pet-controller.ts`
-  - `windows.ts` ↔ `app-state.ts`, `agent-setup.ts`, `catalog.ts`, `codex-pets.ts`
-  - `windows.ts` ↔ `plugin-service.ts`, `plugins-window.ts` for plugin UI IPC and HTML
+  - `windows.ts` ↔ `app-state.ts`, `agent-setup.ts`, `catalog.ts`, `codex-pets.ts`, `update-checker.ts` for Control Center route snapshots/actions
+  - `windows.ts` ↔ `plugin-service.ts` for Control Center plugin UI IPC, plugin commands, and Dashboard plugin health
   - `pet-window.ts` ↔ `default-pet-controller.ts`, `agent-pet-controller.ts`
+  - `pet-window.ts` ↔ `plugin-bubble-arbiter.ts`, `plugin-pet-registry.ts`, `pet-motion-engine.ts` for plugin-driven bubbles, spawned pets, and movement updates
   - `pet-installation.ts` ↔ `app-state.ts`, `catalog.ts`, `zip-safety.ts`
-  - `plugin-service.ts` ↔ `plugin-state.ts`, `plugin-runtime.ts`, `plugin-catalog.ts`, `plugin-package.ts`, `plugin-local-loader.ts`
+  - `plugin-service.ts` ↔ `plugin-state.ts`, `plugin-runtime.ts`, `plugin-catalog.ts`, `plugin-package.ts`, `plugin-local-loader.ts`, `plugin-js-host.ts`, `plugin-sdk-bridge.ts`, plugin SDK namespace modules, diagnostics, assets, settings, panels, voice, OAuth, secrets, and user sounds
+  - `i18n/` ↔ `tray.ts`, `windows.ts`, `pet-window.ts`, `reaction-messages.ts`, `plugin-i18n.ts`
 
 - **To packages/**:
   - `@open-pets/claude`: `buildClaudeMcpPreview`, `installClaudeHooks`, `doctorClaudeHooks`, etc.
   - `@open-pets/opencode`: `prepareOpenCodeGlobalSetup`, `doctorOpenCodeGlobalSetup`
   - `@open-pets/cursor`: `planCursorMcpInstall`, `executeCursorMcpWrite`, `buildCursorRulesPreview`, etc.
   - `@open-pets/cli`: Version lookup for bundled mode
+  - `@open-pets/plugin-sdk`: Published SDK contract mirrored by the desktop bridge and conformance checks
 
 - **To System**:
-  - File system: `app.getPath("userData")`, `userData/plugins/`, `userData/plugins-dev/`, `~/.codex/pets/`, `~/.claude/`, `~/.opencode/`
+  - File system: `app.getPath("userData")`, `userData/plugins/`, `userData/plugins-dev/`, plugin storage JSON, `~/.codex/pets/`, `~/.claude/`, `~/.opencode/`
   - Network: `fetch()` to openpets.dev, GitHub API, plugin catalog at `https://openpets.dev/plugins/catalog.v1.json`, plugin ZIPs restricted to `https://zip.openpets.dev/plugins/`
   - Processes: `spawn()` for `claude`, `opencode`, `node`
 
 ## Key Modules
 
 **Core**:
-- `main.ts`: Entry, single-instance lock, bootstrap sequence
+- `main.ts`: Entry, single-instance lock, bootstrap sequence, JavaScript plugin host construction
 - `lifecycle.ts`: App event handlers (quit, window-all-closed, second-instance) with logging; stops plugin service, IPC, and pet windows on quit
 - `state.ts`: Simple shell pause state
 - `app-state.ts`: Persistent JSON state with V1 schema, atomic writes, reaction animation overrides
@@ -132,19 +174,21 @@ plugin-local-loader.ts validates selected folder manifest and snapshots only ope
 - `logger.ts`: Structured logging with scopes (app, ipc, lease, pet.default, pet.agent, pet.window, state, tray, ui), log rotation, redaction
 
 **UI**:
-- `tray.ts`: Tray icon (nativeImage), context menu builder, update status integration, plugins entry, logs folder
-- `windows.ts`: BrowserWindow factory, IPC handler registration, HTML generators for task windows, reaction animation settings, plugin UI IPC endpoints
+- `tray.ts`: Tray icon (nativeImage), context menu builder, update status integration, route-targeted Control Center entries, logs folder
+- `windows.ts`: Control Center BrowserWindow factory, Dashboard snapshot, IPC handler registration, route targeting, reaction animation settings, plugin/integration/pet/settings UI IPC endpoints, and scoped internal protocols
 - `assets.ts`: Tray icon loading with generated fallback
 - `display.ts`: Screen geometry helpers, pet window positioning
-- `plugins-window.ts`: Sandboxed data-URL HTML/CSS shell for Installed/Discover/Developer plugin management.
+- `renderer/`: Vite React/Tailwind Control Center shell for Dashboard, Pets, Integrations, Plugins, and Settings.
 
 **Pets**:
 - `pet-window.ts`: Window creation (transparent, frameless, always-on-top), HTML/CSS generation, sprite animation states, speech bubbles, status badges, transient displays
 - `default-pet-controller.ts`: Default pet visibility, position persistence, transient reactions, status badges, logging
 - `agent-pet-controller.ts`: Lease-triggered pet windows, dismissal tracking, transient displays, status badges, logging
+- `pet-motion-engine.ts`: Interpolated movement vector/tick engine for plugin-driven pet motion and target-following behavior
 - `built-in-pet.ts`: Built-in pet constant
 - `reaction-messages.ts`: Message pools for each reaction type
 - `reaction-animation-mapping.ts`: Reaction-to-animation state mapping, user-configurable overrides, sprite state definitions
+- `i18n/`: Host message catalogs and localized reaction pools; see [i18n/codemap.md](i18n/codemap.md)
 
 **IPC**:
 - `local-ipc.ts`: net.Server implementation, request routing, discovery file management, network security (loopback/private address filtering), logging
@@ -162,17 +206,43 @@ plugin-local-loader.ts validates selected folder manifest and snapshots only ope
 - `zip-safety.ts`: ZIP entry path validation (traversal prevention, case collision detection)
 
 **Plugins**:
-- `plugin-manifest.ts`: Manifest V1 schema/types and validation for declarative runtime, permissions (`timer`, `pet:speak`, `pet:reaction`), config schema, timer triggers, and pet actions.
+- `plugin-manifest.ts`: Manifest V1/V2/V3 schema/types and validation for declarative and JavaScript runtimes, permissions (`timer`/`schedule`, `pet:*`, `pets:*`, `audio`, `events`, `ui:*`, `notify`, `bus`, `ai`, `secrets`, `voice:*`, `auth`, `files`, `system:*`, `clipboard`, `network:*`), config schema, timer triggers, assets, panels, entry files, and pet actions.
 - `plugin-manifest-reader.ts`: Safe manifest reader with realpath/allowed-root checks, root filename enforcement, size limit, and expected id/version matching.
 - `plugin-config.ts`: Config defaulting, replacement validation, and runtime resolution for string/number config references.
 - `plugin-state.ts`: Persistent plugin state store (`openpets-plugin-state.json`) with atomic temp+rename writes, normalized records, approved permissions, config, source, and broken reason.
-- `plugin-runtime.ts`: Declarative runtime that compiles enabled plugin timer triggers, verifies approved permissions, validates say/react payloads, schedules cancellable timers, and marks broken plugins on validation/action failure.
+- `plugin-runtime.ts`: Runtime that compiles enabled declarative timer triggers, starts/stops JavaScript plugin hosts, verifies approved permissions, exposes public command/status state, validates actions, schedules cancellable timers, and marks broken plugins on validation/action failure.
 - `plugin-pet-api.ts`: Narrow adapter from plugin actions to default pet external `say`/`react` controller calls.
-- `plugin-service.ts`: Application-facing plugin orchestrator for snapshots, enable/disable, config save, reload, catalog install/update, local load, uninstall, permission prompts, compatibility checks, and runtime reloads.
+- `plugin-service.ts`: Application-facing plugin orchestrator for safe snapshots, enable/disable, config save, command execution, reload, catalog install/update, local load, uninstall, permission prompts, compatibility checks, JavaScript host/SDK bridge integration, and runtime reloads.
 - `plugin-catalog.ts`: Remote plugin catalog fetch with timeout, redirect rejection, response size cap, cache, and refresh support.
 - `plugin-catalog-validation.ts`: Catalog V1 schema validation, duplicate id checks, semver/SHA fields, permissions canonicalization, and optional minimum OpenPets version.
 - `plugin-package.ts`: Catalog plugin package download/install with HTTPS host/path allowlist, SHA-256 verification, ZIP size/entry restrictions, manifest/catalog consistency checks, and safe uninstall path resolution.
 - `plugin-local-loader.ts`: Developer loader that validates a selected local folder and snapshots only the manifest into `plugins-dev` with symlink/path/size protections.
+- `plugin-js-host.ts`: Sandboxed hidden BrowserWindow host for JavaScript plugin entry modules with per-plugin session partitioning, navigation/window-open hardening, SDK IPC tokening, registration handshake, config listener cleanup, and teardown.
+- `plugin-sdk-bridge.ts`: Permission-checked JavaScript plugin SDK bridge that validates routes, creates plugin contexts, enforces approved permissions/quotas, and delegates namespace behavior to focused SDK modules.
+- `plugin-sdk-audio.ts`: Audio SDK facade that checks global audio settings, resolves plugin/user sound refs, and reports blocked playback through diagnostics.
+- `plugin-sdk-bus.ts`: Inter-plugin publish/subscribe namespace with clone-safe payload routing and plugin-scoped topic handling.
+- `plugin-sdk-config.ts`: Runtime config read/change namespace backed by validated plugin config state.
+- `plugin-sdk-events.ts`: Curated host event subscription namespace for pet clicks, drag/drop, display, power, idle, and config change signals.
+- `plugin-sdk-quotas.ts`: Shared quota counters and limits for SDK namespaces.
+- `plugin-sdk-routes.ts`: Route table and dispatch contract between preload IPC calls and host SDK handlers.
+- `plugin-sdk-state.ts`: Shared plugin context state, listener cleanup, and lifecycle bookkeeping used by route handlers.
+- `plugin-sdk-storage.ts`: Quota-bound plugin storage namespace with key enumeration and subscriptions.
+- `plugin-sdk-types.ts`: Internal host-side SDK interfaces mirroring the published `@open-pets/plugin-sdk` contract.
+- `plugin-sdk-ui.ts`: Host-rendered UI namespace for bubbles, alerts, menu items, panels, and dynamic interaction callbacks.
+- `plugin-assets.ts`: Declared asset resolution and validation for icon/image/svg/sprite/sound references used by plugin SDK calls and catalog cards.
+- `plugin-bubble-arbiter.ts`: Priority/coalescing arbiter for transient and pinned plugin bubble slots.
+- `plugin-diagnostics.ts`: Per-plugin error/quota/settings-block collector surfaced to inspector and plugin health views.
+- `plugin-events-source.ts`: Host event source adapter for pet/window/system events consumed by `plugin-sdk-events.ts`.
+- `plugin-host-capabilities.ts`: Main-process capability bundle injected into the bridge for Electron side effects.
+- `plugin-i18n.ts`: Plugin locale catalog loader and `$t:`/`ctx.t()` resolver with English fallback.
+- `plugin-oauth.ts`: Host-mediated OAuth/PKCE flow and token session lifecycle for plugins.
+- `plugin-panels.ts`: Sandboxed plugin panel BrowserWindow coordinator and message bridge.
+- `plugin-pet-registry.ts`: Registry for default and plugin-spawned pets, including lifecycle and SDK targeting.
+- `plugin-platform-settings.ts`: Global plugin-platform settings for audio, voice, speech, microphone, quiet hours, and provider toggles.
+- `plugin-secrets.ts`: Plugin-scoped encrypted secret storage backed by Electron safe storage primitives.
+- `plugin-toast.ts`: Host toast/notification routing for plugin UI events.
+- `plugin-user-sound-store.ts`: Plugin-scoped imported user sound registry that stores opaque sound refs instead of raw filesystem paths.
+- `plugin-voice.ts`: Voice/TTS and one-shot listen facade gated by settings and permissions.
 
 **Agent Integration**:
 - `agent-setup.ts`: Claude/OpenCode/Cursor detection, MCP configuration, hooks management, action journaling
@@ -200,5 +270,8 @@ plugin-local-loader.ts validates selected folder manifest and snapshots only ope
 | Plugin catalog | `plugin-catalog.ts`/`plugin-service.ts` | Discoverable plugin metadata filtered by app version and install state |
 | Plugin ZIP/local folder | `plugin-package.ts`/`plugin-local-loader.ts` | Validated manifest snapshot installed under `userData/plugins*` |
 | `plugin-state.ts` | `userData/openpets-plugin-state.json` | Installed plugins, enabled flag, approved permissions, config, broken status |
-| `plugin-runtime.ts` | `plugin-pet-api.ts` | Timer-triggered pet speech/reactions on the default pet |
-| Plugins renderer | `windows.ts`/`plugin-service.ts` | Snapshot, enable, config, reload, install/update/uninstall, local-load operations |
+| Control Center renderer | `control-center-preload.cjs`/`windows.ts` | Narrow Dashboard/Pets/Integrations/Plugins/Settings snapshots and route-targeted actions |
+| `plugin-runtime.ts` | `plugin-pet-api.ts`/`plugin-js-host.ts`/`plugin-sdk-bridge.ts` | Declarative timers and JavaScript SDK actions on default/spawned pets, schedules, storage, commands, status, logs, network, UI, audio, events, bus, AI, OAuth, secrets, voice, and panels |
+| Plugins renderer | `windows.ts`/`plugin-service.ts` | Snapshot, enable, config, command, reload, install/update/uninstall, local-load operations |
+| Locale preference | `i18n/`/`plugin-i18n.ts` | Host UI dictionaries, localized reaction pools, manifest `$t:` values, and runtime `ctx.t()` strings |
+| Plugin SDK asset refs | `plugin-assets.ts`/`plugin-package.ts`/`plugin-sdk-ui.ts` | Validated icons, images, SVGs, sprites, panels, and sounds rendered by host surfaces |

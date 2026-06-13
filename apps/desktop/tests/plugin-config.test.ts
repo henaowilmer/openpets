@@ -16,6 +16,12 @@ assertInvalidReplacement({ mood: "unknown" }, "invalid_select_value");
 assertInvalidReplacement(new Date(), "invalid_config");
 assertInvalidReplacement(new Map(), "invalid_config");
 assertInvalidReplacement([], "invalid_config");
+const soundManifest = manifest({ configSchema: { sound: { type: "sound" } } });
+assert.equal(validatePluginConfigReplacement(soundManifest, { sound: "alert" }).ok, true);
+assert.equal(validatePluginConfigReplacement(soundManifest, { sound: { kind: "user-sound", id: "a".repeat(32), name: "Ding" } }).ok, true);
+assert.equal(validatePluginConfigReplacement(soundManifest, { sound: { kind: "user-sound", id: "../secret" } }).ok, false);
+assert.equal(validatePluginConfigReplacement(soundManifest, { sound: { kind: "user-sound", id: "not-a-hash" } }).ok, false);
+assert.equal(validatePluginConfigReplacement(soundManifest, { sound: "/tmp/ding.wav" }).ok, false);
 assert.deepEqual(validatePluginConfigReplacement(base, { message: "Move", details: "Now", intervalMinutes: 12, enabled: false, mood: "active" }), {
   ok: true,
   config: { details: "Now", enabled: false, intervalMinutes: 12, message: "Move", mood: "active" },

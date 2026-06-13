@@ -1,17 +1,23 @@
-import { app } from "electron";
-import { delimiter, resolve } from "node:path";
+import { app, powerMonitor } from "electron";
+import { existsSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
 
-import { initializeAppState, isOnboardingCompleted, releaseStartupInstallLock } from "./app-state.js";
+import { getAppStateSnapshot, initializeAppState, releaseStartupInstallLock } from "./app-state.js";
+import { createAppIcon } from "./assets.js";
+import { setLocaleFromPreference } from "./i18n/index.js";
 import { installDefaultPetDisplayHandlers, shouldOpenDefaultPetOnLaunch, showDefaultPet } from "./default-pet-controller.js";
 import { installAppLifecycle } from "./lifecycle.js";
 import { debug, error as logError, getLogFilePath, info, initializeLogger, warn } from "./logger.js";
 import { startLocalIpcServer } from "./local-ipc.js";
+import { startDevPluginWatcher } from "./plugin-dev-watcher.js";
+import { createElectronPluginHostCapabilities } from "./plugin-host-capabilities.js";
 import { defaultPluginPetApi } from "./plugin-pet-api.js";
+import { initializePluginPlatformSettings } from "./plugin-platform-settings.js";
 import { ElectronPluginJsHost } from "./plugin-js-host.js";
 import { initializePluginService } from "./plugin-service.js";
 import { createAppTray, refreshTrayMenu } from "./tray.js";
 import { checkForGitHubReleaseUpdate } from "./update-checker.js";
-import { installInternalUiHandlers, installInternalUiProtocol, openTaskWindow } from "./windows.js";
+import { installInternalUiHandlers, installInternalUiProtocol } from "./windows.js";
 
 // OpenPets does not store browser passwords, cookies, or encrypted app secrets.
 // Keep Chromium/Electron from prompting for macOS Keychain or Linux keyring access
@@ -24,6 +30,7 @@ app.commandLine.appendSwitch("password-store", "basic");
 // above normal windows and dragging to a user-chosen screen position. Prefer
 // X11/Xwayland on Linux unless the user explicitly chooses another Ozone
 // backend at launch.
+const hasExplicitOzonePlatformArg = process.argv.some((arg) => arg === "--ozone-platform" || arg.startsWith("--ozone-platform="));
 if (process.platform === "linux" && !app.commandLine.hasSwitch("ozone-platform")) {
   app.commandLine.appendSwitch("ozone-platform", "x11");
 }
@@ -38,35 +45,39 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(async () => {
     initializeLogger();
     app.setName("OpenPets");
+    if (process.platform === "win32") {
+      app.setAppUserModelId("dev.openpets.app");
+    }
     info("app", "startup begin", { version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, pid: process.pid, ozonePlatform: app.commandLine.getSwitchValue("ozone-platform") || null });
 
     if (process.platform === "darwin") {
+      app.dock?.setIcon(createAppIcon());
       app.dock?.hide();
     }
 
     initializeAppState();
+    // Resolve the UI language before any window or the tray is built.
+    setLocaleFromPreference(getAppStateSnapshot().preferences.locale);
     installInternalUiProtocol();
     installInternalUiHandlers();
     createAppTray();
     installDefaultPetDisplayHandlers();
     await startLocalIpcServer();
     releaseStartupInstallLock();
+    const roots = parseDevPluginEnv(process.env.OPENPETS_DEV_PLUGIN_ROOTS);
+    const paths = parseDevPluginEnv(process.env.OPENPETS_DEV_PLUGIN_PATHS);
+    const devPluginMode = roots.length > 0 || paths.length > 0;
+    initializePluginPlatformSettings(app.getPath("userData"));
+    const pluginCapabilities = createElectronPluginHostCapabilities(app.getPath("userData"));
+    const pluginService = initializePluginService(app.getPath("userData"), defaultPluginPetApi, app.getVersion(), new ElectronPluginJsHost(), writePluginRuntimeLog, process.env.OPENPETS_DISABLE_PLUGIN_CATALOG === "1" || devPluginMode, resolveBundledOfficialPluginRoots(), !devPluginMode, pluginCapabilities);
+    // Wall-clock schedules (daily/cron/at) re-arm deterministically after sleep.
+    powerMonitor.on("resume", () => pluginService.runtime.resyncSchedules());
     if (shouldOpenDefaultPetOnLaunch()) {
       showDefaultPet();
     }
-    if (!isOnboardingCompleted()) {
-      try {
-        openTaskWindow("onboarding");
-      } catch (error) {
-        console.error("Failed to open OpenPets onboarding; continuing with tray app.", error);
-      }
-    }
     refreshTrayMenu();
     void (async () => {
-      const roots = parseDevPluginEnv(process.env.OPENPETS_DEV_PLUGIN_ROOTS);
-      const paths = parseDevPluginEnv(process.env.OPENPETS_DEV_PLUGIN_PATHS);
-      const devPluginMode = roots.length > 0 || paths.length > 0;
-      const service = initializePluginService(app.getPath("userData"), defaultPluginPetApi, app.getVersion(), new ElectronPluginJsHost(), writePluginRuntimeLog, process.env.OPENPETS_DISABLE_PLUGIN_CATALOG === "1" || devPluginMode);
+      const service = pluginService;
       await service.start();
       for (const path of paths) {
         const result = await service.loadLocalPath(path, { autoApprove: true });
@@ -76,9 +87,10 @@ if (!gotSingleInstanceLock) {
         const results = await service.loadLocalRoots(roots, { autoApprove: true, pruneStale: true });
         for (const result of results) if (!result.ok) logError("app", "dev plugin root load failed", new Error(`${result.path}: ${result.error}`));
       }
+      if (devPluginMode) startDevPluginWatcher(service, roots, paths);
     })().catch((error) => logError("app", "plugin service startup failed", error));
     void checkForGitHubReleaseUpdate().then(() => refreshTrayMenu());
-    info("app", "startup complete", { logFile: getLogFilePath(), openDefaultPetOnLaunch: shouldOpenDefaultPetOnLaunch(), onboardingCompleted: isOnboardingCompleted() });
+    info("app", "startup complete", { logFile: getLogFilePath(), openDefaultPetOnLaunch: shouldOpenDefaultPetOnLaunch() });
     console.log("OpenPets desktop shell ready.");
   }).catch((error: unknown) => {
     releaseStartupInstallLock();
@@ -91,6 +103,11 @@ if (!gotSingleInstanceLock) {
 function parseDevPluginEnv(value: string | undefined): string[] {
   if (!value) return [];
   return value.split(delimiter).map((item) => item.trim()).filter(Boolean).map((item) => resolve(item));
+}
+
+function resolveBundledOfficialPluginRoots(): string[] {
+  const candidates = [join(process.resourcesPath, "plugins", "official"), resolve(process.cwd(), "plugins", "official"), resolve(app.getAppPath(), "..", "..", "plugins", "official")];
+  return Array.from(new Set(candidates.filter((candidate) => existsSync(candidate))));
 }
 
 function writePluginRuntimeLog(level: "debug" | "info" | "warn" | "error", message: string, fields?: Record<string, unknown>): void {

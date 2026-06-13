@@ -1,6 +1,7 @@
 import type { OpenPetsPluginManifest, PluginConfigField } from "./plugin-manifest.js";
+import { isValidUserSoundId } from "./plugin-user-sound-store.js";
 
-export type PluginConfigValue = string | number | boolean | string[] | Array<Record<string, unknown>>;
+export type PluginConfigValue = string | number | boolean | string[] | Array<Record<string, unknown>> | { kind: "user-sound"; id: string; name?: string } | null;
 export type PluginConfig = Record<string, PluginConfigValue>;
 
 export type PluginConfigValidationError = { path: string; code: string; message: string };
@@ -77,6 +78,7 @@ function validateFieldValue(value: unknown, field: PluginConfigField, path: stri
     return errors;
   }
   if (field.type === "multiSelect") return Array.isArray(value) && value.every((item) => typeof item === "string" && field.options?.some((option) => option.value === item)) ? [] : [{ path, code: "invalid_config_value", message: "Multi-select config value must be an array of option values." }];
+  if (field.type === "sound") return isValidSoundConfigValue(value) ? [] : [{ path, code: "invalid_config_value", message: "Sound config value must be a host sound name or user sound reference." }];
   if (value === null || Array.isArray(value) || typeof value === "object") return [{ path, code: "invalid_config_value", message: "Config value must match the field type." }];
   if (field.type === "text" || field.type === "textarea") {
     if (typeof value !== "string") errors.push({ path, code: "invalid_config_value", message: "Config value must be a string." });
@@ -96,6 +98,17 @@ function validateFieldValue(value: unknown, field: PluginConfigField, path: stri
 }
 
 function isValidTime(value: string): boolean { const m = /^(\d{2}):(\d{2})$/.exec(value); return !!m && Number(m[1]) <= 23 && Number(m[2]) <= 59; }
+
+function isValidSoundConfigValue(value: unknown): boolean {
+  if (value === null || value === "") return true;
+  if (typeof value === "string") return value.length <= 80 && /^[A-Za-z0-9._-]+$/.test(value) && !looksLikeFilesystemPath(value);
+  if (!isPlainRecord(value)) return false;
+  return value.kind === "user-sound" && isValidUserSoundId(value.id) && (value.name === undefined || (typeof value.name === "string" && value.name.length <= 120));
+}
+
+function looksLikeFilesystemPath(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("~") || /^[A-Za-z]:[\\/]/.test(value) || value.includes("\\") || value.includes("/") || value.startsWith("file:");
+}
 
 function configSchemaEntries(manifest: OpenPetsPluginManifest): Array<[string, PluginConfigField]> {
   return Object.entries(manifest.configSchema ?? {}).sort(([a], [b]) => a.localeCompare(b));

@@ -12,6 +12,9 @@ import { claudeHookEvents, openPetsHookMarker, removeOpenPetsHooks, runClaudeHoo
 import { buildCursorRulesPreview, buildOpenPetsOnlyPreview, classifyCursorMcpStatus, classifyCursorRulesStatus, executeCursorMcpWrite, executeCursorRulesWrite, getCursorProjectMcpPath, getCursorProjectRulesPath, planCursorMcpInstall, planCursorMcpReplace, planCursorRulesInstall, planCursorRulesRemove, planCursorRulesReplace, readCursorMcpConfig, readCursorOpenPetsRules } from "@open-pets/cursor";
 import { prepareOpenCodeProjectSetup, writePreparedOpenCodeProjectSetup } from "@open-pets/opencode";
 
+import { pluginTemplateNames, pluginTemplates, type PluginTemplateName } from "./plugin-templates.js";
+import { validatePluginFolder } from "./plugin-validate.js";
+
 export const cliPackageName = "@open-pets/cli";
 
 interface ConfigureOptions {
@@ -45,6 +48,14 @@ interface CommandSpec {
 }
 
 type BackendOption = "ipc" | "termux";
+
+interface PluginNewOptions {
+  readonly name: string;
+  readonly id: string;
+  readonly dir: string;
+  readonly author?: string;
+  readonly template: PluginTemplateName;
+}
 
 interface PreparedHooks {
   readonly settingsPath: string;
@@ -133,6 +144,38 @@ async function main(): Promise<void> {
     const code = await runClaudeHookFromStdin(process.stdin, { configuredPetId: readPetArg(args), projectLocal: hasProjectLocalArg(args), debug: process.env.OPENPETS_DEBUG === "1" });
     process.exitCode = code;
     return;
+  }
+  if (command === "plugin") {
+    const [subcommand, ...rest] = args;
+    if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+      printPluginUsage();
+      return;
+    }
+    if (subcommand === "new" || subcommand === "init") {
+      if (hasHelp(rest)) {
+        printPluginUsage();
+        return;
+      }
+      scaffoldPlugin(parsePluginNewArgs(rest));
+      return;
+    }
+    if (subcommand === "validate") {
+      if (hasHelp(rest)) {
+        printPluginUsage();
+        return;
+      }
+      const target = rest.find((arg) => !arg.startsWith("--")) ?? ".";
+      const result = validatePluginFolder(target);
+      if (result.ok) {
+        process.stdout.write(`Plugin manifest and declared files look valid: ${resolve(target)}\n`);
+        return;
+      }
+      process.stderr.write(`Plugin validation failed (${result.issues.length} issue${result.issues.length === 1 ? "" : "s"}):\n`);
+      for (const issue of result.issues) process.stderr.write(`  ${issue.path}: ${issue.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw new CliError(`Unknown plugin subcommand: ${subcommand}`);
   }
   throw new CliError(`Unknown command: ${command}`);
 }
@@ -349,6 +392,127 @@ function setCursorRulesMode(current: ConfigureOptions["cursorRulesMode"], next: 
 export function parseInstallArgs(args: readonly string[]): InstallOptions {
   if (args.length !== 1) throw new CliError("Usage: openpets install <pet-id>");
   return { petId: validateOpenPetsPetArg(args[0] ?? "") };
+}
+
+export function parsePluginNewArgs(args: readonly string[]): PluginNewOptions {
+  let name: string | undefined;
+  let id: string | undefined;
+  let dir: string | undefined;
+  let author: string | undefined;
+  let template: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--id") { id = readRequiredArg(args, index, "--id"); index += 1; }
+    else if (arg.startsWith("--id=")) id = arg.slice("--id=".length);
+    else if (arg === "--dir") { dir = readRequiredArg(args, index, "--dir"); index += 1; }
+    else if (arg.startsWith("--dir=")) dir = arg.slice("--dir=".length);
+    else if (arg === "--author") { author = readRequiredArg(args, index, "--author"); index += 1; }
+    else if (arg.startsWith("--author=")) author = arg.slice("--author=".length);
+    else if (arg === "--template") { template = readRequiredArg(args, index, "--template"); index += 1; }
+    else if (arg.startsWith("--template=")) template = arg.slice("--template=".length);
+    else if (arg.startsWith("--")) throw new CliError(`Unknown plugin new option: ${arg}`);
+    else if (name === undefined) name = arg;
+    else throw new CliError(`Unexpected argument: ${arg}`);
+  }
+  const cleanName = (name ?? "").trim();
+  if (!cleanName) throw new CliError("Usage: openpets plugin new <name> [--template <template>] [--id <id>] [--dir <path>] [--author <name>]");
+  if (cleanName.length > 60 || /[\x00-\x1F\x7F]/.test(cleanName)) throw new CliError("Plugin name must be 1-60 printable characters.");
+  const slug = slugifyPluginName(cleanName);
+  if (!slug) throw new CliError("Plugin name must contain at least one letter or number.");
+  const finalId = (id ?? `local.${slug}`).trim();
+  if (!isValidPluginId(finalId)) throw new CliError("Plugin id must be 1-64 chars (letters, numbers, dot, dash, underscore) and cannot start with a dot.");
+  const finalTemplate = (template ?? "blank").trim() as PluginTemplateName;
+  if (!pluginTemplateNames.includes(finalTemplate)) throw new CliError(`Unknown plugin template: ${finalTemplate}. Templates: ${pluginTemplateNames.join(", ")}.`);
+  return { name: cleanName, id: finalId, dir: dir ?? slug, author: author?.trim() || undefined, template: finalTemplate };
+}
+
+function slugifyPluginName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function isValidPluginId(id: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id);
+}
+
+export function scaffoldPlugin(options: PluginNewOptions): { readonly dir: string; readonly manifestPath: string; readonly entryPath: string } {
+  const targetDir = resolve(options.dir);
+  const manifestPath = join(targetDir, "openpets.plugin.json");
+  const entryPath = join(targetDir, "index.js");
+  if (existsSync(manifestPath) || existsSync(entryPath)) throw new CliError(`A plugin already exists at ${targetDir}. Choose another --dir.`);
+  mkdirSync(targetDir, { recursive: true });
+  const dirStats = lstatSync(targetDir);
+  if (dirStats.isSymbolicLink() || !dirStats.isDirectory()) throw new CliError("Target plugin path must be a directory.");
+
+  const template = pluginTemplates[options.template];
+  const manifest = {
+    $schema: "https://openpets.dev/schemas/openpets.plugin.schema.json",
+    manifestVersion: 3,
+    id: options.id,
+    name: options.name,
+    version: "1.0.0",
+    description: `${options.name} — ${template.description}`,
+    runtime: "javascript",
+    entry: "index.js",
+    sdkVersion: "3.0.0",
+    permissions: template.permissions,
+    configSchema: template.configSchema,
+  };
+  const templateContext = { id: options.id, name: options.name };
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+  writeFileSync(entryPath, template.entry(templateContext), { encoding: "utf8", flag: "wx" });
+  writeFileSync(join(targetDir, "test.js"), template.test(templateContext), { encoding: "utf8", flag: "wx" });
+  // Templates that localize host-rendered strings ($t:) or runtime bodies
+  // (ctx.t) ship a source locales/en.json; the host loads locales/<locale>.json
+  // and falls back to en. Write it whenever the template declares one.
+  if (template.locales) {
+    const localesDir = join(targetDir, "locales");
+    mkdirSync(localesDir, { recursive: true });
+    writeFileSync(join(localesDir, "en.json"), `${JSON.stringify(template.locales(templateContext), null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+  }
+  const packageJsonPath = join(targetDir, "package.json");
+  if (!existsSync(packageJsonPath)) {
+    writeFileSync(packageJsonPath, `${JSON.stringify({ name: slugifyPluginName(options.name) || "openpets-plugin", private: true, type: "module", scripts: { test: "node test.js" }, devDependencies: { "@open-pets/plugin-sdk": "^3.0.0" } }, null, 2)}\n`, { encoding: "utf8" });
+  }
+  const readmePath = join(targetDir, "README.md");
+  if (!existsSync(readmePath)) writeFileSync(readmePath, pluginReadmeTemplate(options, targetDir), { encoding: "utf8" });
+
+  process.stdout.write(
+    `Created OpenPets plugin "${sanitizeTerminalText(options.name)}" (${options.id}) from the ${options.template} template\n  ${targetDir}\n\n` +
+      "Next steps:\n" +
+      "  1. npm install              # pulls @open-pets/plugin-sdk for types + the test kit\n" +
+      "  2. npm test                 # deterministic harness, no app needed\n" +
+      "  3. From the OpenPets repo root, run it live with hot reload:\n" +
+      `     OPENPETS_DEV_PLUGIN_PATHS=${targetDir} pnpm dev:desktop\n` +
+      "  4. Open Tray → Plugins, enable it, then right-click your pet.\n\n" +
+      `Validate anytime: openpets plugin validate ${targetDir}\n` +
+      "Docs: https://openpets.dev/sdk\n",
+  );
+  return { dir: targetDir, manifestPath, entryPath };
+}
+
+function pluginReadmeTemplate(options: PluginNewOptions, targetDir: string): string {
+  return `# ${options.name}
+
+An OpenPets plugin (\`${options.id}\`).
+
+## Develop
+
+\`\`\`bash
+# optional: editor autocomplete + type-checking
+npm i -D @open-pets/plugin-sdk
+
+# from the OpenPets repo root, load this folder and launch the app
+OPENPETS_DEV_PLUGIN_PATHS=${targetDir} pnpm dev:desktop
+\`\`\`
+
+Then open **Tray → Plugins**, enable the plugin, and right-click your pet to
+run its commands.
+
+## Learn more
+
+- SDK guide: https://openpets.dev/sdk
+- Reference: https://openpets.dev/docs/plugin-sdk
+`;
 }
 
 export function parseReactArgs(args: readonly string[]): ReactOptions {
@@ -584,7 +748,25 @@ function getPackageVersion(): string {
 }
 
 function printUsage(): void {
-  process.stdout.write("Usage:\n  openpets status [--backend <ipc|termux>]\n  openpets pets [--backend <ipc|termux>]\n  openpets react <reaction> [--backend <ipc|termux>]\n  openpets say <message> [--reaction <reaction>] [--backend <ipc|termux>]\n  openpets install <pet-id>\n  openpets configure [--agent claude|opencode|cursor] [--pet <id>] [--cwd <path>] [--yes] [--force] [--with-rules|--rules-only|--remove-rules]\n  openpets mcp [--pet <id>] [--backend <ipc|termux>]\n  openpets hook --openpets-managed [--pet <id>]\n\nRun `openpets <command> --help` for command options.\n");
+  process.stdout.write("Usage:\n  openpets status [--backend <ipc|termux>]\n  openpets pets [--backend <ipc|termux>]\n  openpets react <reaction> [--backend <ipc|termux>]\n  openpets say <message> [--reaction <reaction>] [--backend <ipc|termux>]\n  openpets install <pet-id>\n  openpets configure [--agent claude|opencode|cursor] [--pet <id>] [--cwd <path>] [--yes] [--force] [--with-rules|--rules-only|--remove-rules]\n  openpets plugin new <name> [--template <template>] [--id <id>] [--dir <path>] [--author <name>]\n  openpets plugin validate [dir]\n  openpets mcp [--pet <id>] [--backend <ipc|termux>]\n  openpets hook --openpets-managed [--pet <id>]\n\nRun `openpets <command> --help` for command options.\n");
+}
+
+function printPluginUsage(): void {
+  process.stdout.write(
+    "Usage:\n" +
+      "  openpets plugin new <name> [--template <template>] [--id <id>] [--dir <path>] [--author <name>]\n" +
+      "  openpets plugin validate [dir]\n\n" +
+      "plugin new scaffolds a typed SDK v3 plugin with a manifest, a working entry, and a passing\n" +
+      "test built on @open-pets/plugin-sdk/testing. plugin validate checks the manifest, config\n" +
+      "schema, declared assets/panels, permissions, and network hosts at author time.\n\n" +
+      "Options:\n" +
+      `  --template <t>   Template: ${pluginTemplateNames.join(", ")}. Defaults to blank.\n` +
+      "  --id <id>        Plugin id (reverse-DNS style). Defaults to local.<name-slug>.\n" +
+      "  --dir <path>     Target directory. Defaults to ./<name-slug>.\n" +
+      "  --author <name>  Author name (informational).\n" +
+      "  -h, --help       Show this help.\n\n" +
+      "Learn more: https://openpets.dev/sdk\n",
+  );
 }
 
 function printInstallUsage(): void {
@@ -592,11 +774,11 @@ function printInstallUsage(): void {
 }
 
 function printStatusUsage(): void {
-  process.stdout.write("Usage:\n  openpets status\n\nChecks whether the OpenPets desktop app is reachable and prints the status response as JSON.\n");
+  process.stdout.write("Usage:\n  openpets status [--backend <ipc|termux>]\n\nChecks whether the configured OpenPets backend is reachable and prints the status response as JSON.\n");
 }
 
 function printPetsUsage(): void {
-  process.stdout.write("Usage:\n  openpets pets\n\nLists pets installed in the running OpenPets desktop app.\n");
+  process.stdout.write("Usage:\n  openpets pets [--backend <ipc|termux>]\n\nLists pets available from the configured OpenPets backend.\n");
 }
 
 function printReactUsage(): void {
